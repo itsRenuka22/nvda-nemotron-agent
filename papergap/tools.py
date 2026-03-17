@@ -27,13 +27,36 @@ def _decode_abstract(inv_index: Dict[str, List[int]]) -> str:
     return ' '.join(words).strip()
 
 
+def _fetch_openalex(
+    topic: str,
+    years: str,
+    sort: str = "cited_by_count:desc",
+    limit: int = 100
+) -> List[Dict]:
+    """Make a single OpenAlex API request and return raw result items."""
+    params = {
+        "search": topic,
+        "filter": f"publication_year:{years},has_abstract:true",
+        "sort": sort,
+        "per_page": min(limit, 200),
+        "select": "id,title,abstract_inverted_index,publication_year,cited_by_count,topics"
+    }
+    response = requests.get("https://api.openalex.org/works", params=params)
+    response.raise_for_status()
+    return response.json().get('results', [])
+
+
 def fetch_papers(
     topic: str,
     trace: AgentTrace,
     years: str = "2022-2025",
     limit: int = 200
 ) -> List[Paper]:
-    """Fetch papers from OpenAlex API and cache results.
+    """Fetch papers from OpenAlex API using dual-query strategy and cache results.
+
+    Makes two queries — top-cited (established research) + most-recent (emerging
+    directions) — then merges and deduplicates. This ensures emerging research
+    gaps are visible alongside established areas.
 
     Args:
         topic: Search query for papers
@@ -55,32 +78,41 @@ def fetch_papers(
         trace.log(f"Loading cached papers for '{topic}'")
         with open(cache_file, 'r') as f:
             data = json.load(f)
+        all_results = data.get('results', [])
     else:
-        # Fetch from OpenAlex API
-        trace.log(f"Fetching papers for '{topic}' from OpenAlex API")
+        # FIX 3: Dual-query strategy — top cited + most recent
+        half = limit // 2
 
-        params = {
-            "search": topic,
-            "filter": f"publication_year:{years},has_abstract:true",
-            "sort": "cited_by_count:desc",
-            "per_page": limit,
-            "select": "id,title,abstract_inverted_index,publication_year,cited_by_count,topics"
-        }
+        # Query 1: Most cited papers (established research baseline)
+        trace.log(f"Fetching top-cited papers for '{topic}' from OpenAlex API")
+        cited_results = _fetch_openalex(topic, years, sort="cited_by_count:desc", limit=half)
+        trace.log(f"  Got {len(cited_results)} top-cited papers")
 
-        response = requests.get("https://api.openalex.org/works", params=params)
-        response.raise_for_status()
+        # Query 2: Most recent papers (emerging research directions — 2024+)
+        trace.log(f"Fetching recent papers for '{topic}' from OpenAlex API")
+        recent_results = _fetch_openalex(topic, years, sort="publication_date:desc", limit=half)
+        trace.log(f"  Got {len(recent_results)} recent papers")
 
-        data = response.json()
-        trace.log(f"Got {len(data.get('results', []))} results from API")
+        # Merge and deduplicate by paper ID
+        seen_ids: set = set()
+        all_results = []
+        for item in cited_results + recent_results:
+            pid = item.get('id', '')
+            if pid not in seen_ids:
+                seen_ids.add(pid)
+                all_results.append(item)
 
-        # Cache the raw JSON
+        n_dupes = len(cited_results) + len(recent_results) - len(all_results)
+        trace.log(f"Merged to {len(all_results)} unique papers ({n_dupes} duplicates removed)")
+
+        # Cache the combined result
         with open(cache_file, 'w') as f:
-            json.dump(data, f, indent=2)
-        trace.log(f"Cached results to {cache_file}")
+            json.dump({'results': all_results}, f, indent=2)
+        trace.log(f"Cached {len(all_results)} papers to {cache_file}")
 
     # Convert to Paper objects
     papers = []
-    results = data.get('results', [])
+    results = all_results
     trace.log(f"Processing {len(results)} papers")
 
     for i, item in enumerate(results):

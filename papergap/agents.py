@@ -4,6 +4,38 @@ from client import ask
 from models import Gap, Subtopic, TrendPoint, AgentTrace, Paper, ResearchQuestion
 
 
+def _gap_score(subtopic: Subtopic) -> float:
+    """Compute gap score: citation intensity per paper × inverse of recent supply.
+
+    High score = many citations per paper (demand) but few recent papers (supply not growing).
+    This is more meaningful than raw avg_citations which rewards already-established areas.
+    """
+    if not subtopic.papers:
+        return 0.0
+    recent_count = sum(1 for p in subtopic.papers if p.year >= 2024)
+    citation_intensity = subtopic.avg_citations / max(subtopic.paper_count, 1)
+    # Penalise subtopics with growing recent output (supply increasing → less of a gap)
+    supply_gap_factor = 1.0 / (1 + recent_count)
+    return citation_intensity * supply_gap_factor
+
+
+def _topic_overlap(gap_subtopic: str, paper_topic: str, threshold: float = 0.4) -> bool:
+    """True if gap subtopic and paper topic share enough meaningful words.
+
+    Used as fuzzy fallback when Nemotron generates a gap name that differs
+    slightly from the exact OpenAlex topic string.
+    """
+    stop_words = {'and', 'or', 'the', 'in', 'of', 'for', 'to', 'a', 'an', 'with', 'using'}
+    gap_words = {w.lower() for w in gap_subtopic.split()
+                 if w.lower() not in stop_words and len(w) > 2}
+    topic_words = {w.lower() for w in paper_topic.split()
+                   if w.lower() not in stop_words and len(w) > 2}
+    if not gap_words or not topic_words:
+        return False
+    overlap = len(gap_words & topic_words)
+    return overlap / min(len(gap_words), len(topic_words)) >= threshold
+
+
 def gap_detection_agent(
     subtopics: List[Subtopic],
     trends: List[TrendPoint],
@@ -27,25 +59,29 @@ def gap_detection_agent(
     # ── Step 1: Build subtopic summary ──────────────────────────────
     trace.log("Building subtopic summary...")
 
-    # Filter out single-paper outliers that would skew gap detection.
-    # A subtopic with only 1 paper but 3000+ citations is just a stray
-    # high-impact paper from another field, not a real gap.
+    # Filter out single-paper outliers with extreme citations from unrelated fields
     filtered_subtopics = [
         s for s in subtopics
         if s.paper_count >= 2 or s.avg_citations < 500
     ]
-
-    # Fall back to all subtopics if filtering removed too many
     if len(filtered_subtopics) < 5:
         filtered_subtopics = subtopics
 
-    # Sort by paper_count descending to surface the most represented areas
-    sorted_subtopics = sorted(filtered_subtopics, key=lambda s: s.paper_count, reverse=True)
+    # FIX 2: Sort by gap_score (citation intensity ÷ recent supply) instead of raw citations
+    sorted_subtopics = sorted(filtered_subtopics, key=_gap_score, reverse=True)
+    top_subtopics = sorted_subtopics[:15]
 
+    # Build summary with gap_score so Nemotron can reason about demand vs supply
     subtopic_summary = "\n".join(
-        f"- {s.name}: {s.paper_count} papers, avg {s.avg_citations:.0f} citations ({s.pct_of_total:.1f}%)"
-        for s in sorted_subtopics[:15]  # Top 15 by paper count
+        f"- {s.name}: {s.paper_count} papers, "
+        f"avg_citations={s.avg_citations:.0f}, "
+        f"recent_2024={sum(1 for p in s.papers if p.year >= 2024)}, "
+        f"gap_score={_gap_score(s):.1f}"
+        for s in top_subtopics
     )
+
+    # FIX 1: Build exact name list Nemotron must choose from
+    allowed_names = "\n".join(f"  - {s.name}" for s in top_subtopics)
 
     # ── Step 2: Build trend summary ────────────────────────────────
     trace.log("Building trend summary...")
@@ -78,27 +114,31 @@ def gap_detection_agent(
     # ── Step 4: Prompt Nemotron ───────────────────────────────────
     trace.log("Calling Nemotron for gap analysis...")
 
-    topic_context = f"Research domain: '{topic}'\n\n" if topic else ""
+    prompt = f"""You are a research gap analyst for the domain: '{topic}'.
 
-    prompt = f"""You are a research gap analyst specializing in '{topic}'.
+gap_score = avg_citations_per_paper ÷ (1 + recent_2024_papers).
+Higher gap_score = stronger unmet demand relative to recent output.
 
-{topic_context}These are the subtopics found in papers about '{topic}':
+Subtopics found in papers about '{topic}' (sorted by gap_score descending):
 {subtopic_summary}
 
 Year-by-year publication trends:
 {trend_summary}
 
-Semantically isolated papers (emerging directions within '{topic}'):
+Semantically isolated emerging papers within '{topic}':
 {orphan_titles}
 
-IMPORTANT: Identify the top 3 research gaps WITHIN the domain of '{topic}'.
-- Only report gaps directly relevant to '{topic}'
-- Ignore subtopics that are clearly from unrelated fields
-- A gap = high citation demand (many papers cite this area) but low publication supply (few papers exist)
-- For each gap explain WHY it is under-researched in 2 sentences
+TASK: Identify the top 3 research gaps within '{topic}'.
 
-Return ONLY valid JSON (no markdown):
-[{{"subtopic":"name","why_its_a_gap":"explanation","citation_demand":0.0,"publication_supply":0}}]"""
+CRITICAL RULES:
+1. You MUST use subtopic names ONLY from this exact list — copy the string character for character:
+{allowed_names}
+2. Do NOT invent, rephrase, or abbreviate subtopic names.
+3. Only choose gaps relevant to '{topic}' — ignore off-topic outliers.
+4. Prefer subtopics with high gap_score (high citation intensity, low recent output).
+
+Return ONLY valid JSON array (no markdown, no explanation before or after):
+[{{"subtopic":"exact name from list","why_its_a_gap":"2 sentence explanation","citation_demand":0.0,"publication_supply":0}}]"""
 
     try:
         response = ask(prompt, reasoning=True)
@@ -156,17 +196,19 @@ Return ONLY valid JSON (no markdown):
             trace.log(f"JSON parsing failed: {e}, using fallback")
 
     # ── Step 6: Fallback logic ────────────────────────────────────
-    trace.log("Using fallback gap detection from citation/supply ratio...")
+    trace.log("Using fallback gap detection from gap_score ranking...")
 
-    # Create gaps from top subtopics by citation/paper ratio
     fallback_gaps = []
-
-    for subtopic in sorted_subtopics[:3]:
+    for subtopic in top_subtopics[:3]:
         if subtopic.paper_count > 0:
-            ratio = subtopic.avg_citations / subtopic.paper_count
+            recent = sum(1 for p in subtopic.papers if p.year >= 2024)
             gap = Gap(
                 subtopic=subtopic.name,
-                why_its_a_gap=f"High citation demand ({subtopic.avg_citations:.0f} avg) with limited publications ({subtopic.paper_count} papers). Research in this area is valued but under-explored.",
+                why_its_a_gap=(
+                    f"High citation intensity ({subtopic.avg_citations:.0f} avg citations, "
+                    f"{subtopic.paper_count} papers) with only {recent} papers published in 2024. "
+                    f"Demand outpaces recent supply, indicating an underserved research need."
+                ),
                 citation_demand=subtopic.avg_citations,
                 publication_supply=subtopic.paper_count,
                 orphan_papers=[p.title for p in orphans],
@@ -201,10 +243,27 @@ def question_generation_agent(
         trace.log(f"Generating questions for gap: {gap.subtopic}")
 
         # ── Step 1: Find papers matching gap.subtopic ──────────────
+        # Try exact match first (works when Nemotron followed the constraint)
         matching_papers = [
             p for p in all_papers
             if p.topics and p.topics[0] == gap.subtopic
         ]
+
+        # FIX 1: Fuzzy word-overlap fallback across top 3 topics per paper
+        if not matching_papers:
+            matching_papers = [
+                p for p in all_papers
+                if p.topics and any(
+                    _topic_overlap(gap.subtopic, t) for t in p.topics[:3]
+                )
+            ]
+            if matching_papers:
+                trace.log(f"  Fuzzy match found {len(matching_papers)} papers for '{gap.subtopic}'")
+
+        # Last resort: use all papers — Nemotron still has full topic context in prompt
+        if not matching_papers:
+            matching_papers = all_papers
+            trace.log(f"  No topic match — using all {len(all_papers)} papers as context")
 
         # Sort by citations descending, take top 8
         matching_papers.sort(key=lambda p: p.citations, reverse=True)
