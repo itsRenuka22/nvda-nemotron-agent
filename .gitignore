@@ -1,0 +1,46 @@
+# Virtual environments
+venv/
+env/
+.venv/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Cache
+cache/
+*.cache
+.pytest_cache/
+
+# OS
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+
+# Test files (keep in repo but ignore pytest artifacts)
+.coverage
+htmlcov/
+
+# Temporary files
+*.tmp
+*.temp
