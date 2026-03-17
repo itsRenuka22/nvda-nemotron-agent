@@ -1,9 +1,24 @@
 import json
+import re
+import time
 import requests
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import warnings
 from models import Paper, AgentTrace, TrendPoint, Subtopic
+
+# FIX 7: Cache TTL — re-fetch if data is older than this many days
+CACHE_TTL_DAYS = 30
+
+# FIX 4: OpenAlex topic names that are too generic to be useful as subtopic labels.
+# When topics[0] is one of these, we look deeper in the topic list for something specific.
+_GENERIC_TOPICS = {
+    "Artificial Intelligence", "Machine Learning", "Computer Science",
+    "Deep Learning", "Natural Language Processing", "Neural Networks",
+    "Data Science", "Medicine", "Biology", "Physics", "Mathematics",
+    "Engineering", "Technology", "Science", "Education", "Psychology",
+    "Economics", "Social Science", "Chemistry", "Environmental Science",
+}
 
 
 def _decode_abstract(inv_index: Dict[str, List[int]]) -> str:
@@ -73,8 +88,20 @@ def fetch_papers(
 
     cache_file = cache_dir / f"{topic.replace(' ', '_')}_{years}.json"
 
-    # Try to load from cache
-    if cache_file.exists():
+    # FIX 7: Load cache only if it exists AND is not expired
+    def _cache_is_valid(path: Path) -> bool:
+        if not path.exists():
+            return False
+        with open(path, 'r') as f:
+            d = json.load(f)
+        cached_at = d.get('_cached_at', 0)
+        age_days = (time.time() - cached_at) / 86400
+        if age_days > CACHE_TTL_DAYS:
+            trace.log(f"Cache expired ({age_days:.0f} days old) — re-fetching")
+            return False
+        return True
+
+    if _cache_is_valid(cache_file):
         trace.log(f"Loading cached papers for '{topic}'")
         with open(cache_file, 'r') as f:
             data = json.load(f)
@@ -105,9 +132,9 @@ def fetch_papers(
         n_dupes = len(cited_results) + len(recent_results) - len(all_results)
         trace.log(f"Merged to {len(all_results)} unique papers ({n_dupes} duplicates removed)")
 
-        # Cache the combined result
+        # Cache combined result with timestamp (Fix 7)
         with open(cache_file, 'w') as f:
-            json.dump({'results': all_results}, f, indent=2)
+            json.dump({'results': all_results, '_cached_at': time.time()}, f, indent=2)
         trace.log(f"Cached {len(all_results)} papers to {cache_file}")
 
     # Convert to Paper objects
@@ -210,8 +237,18 @@ def cluster_by_topic(papers: List[Paper], trace: AgentTrace) -> List[Subtopic]:
     topic_groups: Dict[str, List[Paper]] = {}
 
     for paper in papers:
-        # Use first topic or "Uncategorized"
-        topic_name = paper.topics[0] if paper.topics else "Uncategorized"
+        # FIX 4: Prefer a specific topic over a generic one.
+        # OpenAlex topics[0] is often too broad (e.g. "Artificial Intelligence").
+        # Walk the top 3 topics and pick the first non-generic one.
+        topic_name = "Uncategorized"
+        for t in paper.topics[:3]:
+            if t and t not in _GENERIC_TOPICS:
+                topic_name = t
+                break
+        else:
+            # All top-3 are generic — fall back to topics[0]
+            if paper.topics:
+                topic_name = paper.topics[0]
 
         if topic_name not in topic_groups:
             topic_groups[topic_name] = []

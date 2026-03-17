@@ -1,7 +1,50 @@
 import json
+import re
 from typing import List, Dict, Any, Optional
 from client import ask
 from models import Gap, Subtopic, TrendPoint, AgentTrace, Paper, ResearchQuestion
+
+
+def _extract_json_array(text: str) -> str:
+    """Robustly extract the first valid JSON array from an LLM response.
+
+    Handles: markdown code blocks, explanatory text before/after JSON,
+    and nested brackets. Uses bracket-counting instead of fragile rfind.
+    """
+    # Strip markdown fences
+    text = re.sub(r'```(?:json)?\s*', '', text)
+    text = re.sub(r'```\s*$', '', text, flags=re.MULTILINE)
+    text = text.strip()
+
+    # Find the opening bracket
+    start = text.find('[')
+    if start == -1:
+        return '[]'
+
+    # Walk forward counting brackets to find the matching close
+    depth = 0
+    in_string = False
+    escape_next = False
+    for i, ch in enumerate(text[start:], start):
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == '\\' and in_string:
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == '[':
+            depth += 1
+        elif ch == ']':
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+
+    return '[]'
 
 
 def _gap_score(subtopic: Subtopic) -> float:
@@ -154,23 +197,8 @@ Return ONLY valid JSON array (no markdown, no explanation before or after):
 
     if response:
         try:
-            # Strip markdown code blocks if present
-            cleaned = response.strip()
-            if cleaned.startswith("```"):
-                cleaned = cleaned.split("```")[1]
-                if cleaned.startswith("json"):
-                    cleaned = cleaned[4:]
-                cleaned = cleaned.strip()
-
-            # If still not valid JSON, try to extract JSON array from response
-            if not cleaned.startswith("["):
-                # Look for [ ... ] pattern in response
-                start_idx = cleaned.find("[")
-                end_idx = cleaned.rfind("]")
-                if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-                    cleaned = cleaned[start_idx:end_idx + 1]
-
-            # Parse JSON
+            # FIX 6: Robust bracket-matching extraction
+            cleaned = _extract_json_array(response)
             gaps_data = json.loads(cleaned)
 
             # Create Gap objects
@@ -323,23 +351,8 @@ Return ONLY valid JSON:
 
         if response:
             try:
-                # Strip markdown code blocks if present
-                cleaned = response.strip()
-                if cleaned.startswith("```"):
-                    cleaned = cleaned.split("```")[1]
-                    if cleaned.startswith("json"):
-                        cleaned = cleaned[4:]
-                    cleaned = cleaned.strip()
-
-                # If still not valid JSON, try to extract JSON array from response
-                if not cleaned.startswith("["):
-                    # Look for [ ... ] pattern in response
-                    start_idx = cleaned.find("[")
-                    end_idx = cleaned.rfind("]")
-                    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-                        cleaned = cleaned[start_idx:end_idx + 1]
-
-                # Parse JSON
+                # FIX 6: Robust bracket-matching extraction
+                cleaned = _extract_json_array(response)
                 questions_data = json.loads(cleaned)
 
                 # Create ResearchQuestion objects
@@ -436,8 +449,10 @@ def run_pipeline(topic: str, trace: Optional[AgentTrace] = None) -> Dict[str, An
                 f"AUTONOMOUS: '{dominant.name}' dominates {dominant_pct:.0f}% — drilling deeper..."
             )
 
-            # Drill down with more specific topic
-            specific_topic = f"{topic} {dominant.name.split()[0]}"
+            # FIX 5: Use meaningful keywords from dominant subtopic, not just first word
+            _stop = {'and', 'or', 'the', 'in', 'of', 'for', 'to', 'a', 'an', 'with', 'using'}
+            key_words = [w for w in dominant.name.split() if w.lower() not in _stop][:3]
+            specific_topic = f"{topic} {' '.join(key_words)}"
             trace.log(f"Phase 1b: Fetching papers for '{specific_topic}'...")
             sub_papers = fetch_papers(specific_topic, trace, limit=100)
 
