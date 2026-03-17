@@ -8,7 +8,8 @@ def gap_detection_agent(
     subtopics: List[Subtopic],
     trends: List[TrendPoint],
     semantic_result: Dict[str, Any],
-    trace: AgentTrace
+    trace: AgentTrace,
+    topic: str = ""
 ) -> List[Gap]:
     """Detect research gaps using Nemotron analysis.
 
@@ -17,6 +18,7 @@ def gap_detection_agent(
         trends: List of TrendPoint objects showing publication trends
         semantic_result: Dict with "orphans" key containing list of Paper objects
         trace: AgentTrace object for logging
+        topic: Original search topic for domain-relevant gap analysis
 
     Returns:
         List of Gap objects identified by Nemotron analysis
@@ -25,12 +27,24 @@ def gap_detection_agent(
     # ── Step 1: Build subtopic summary ──────────────────────────────
     trace.log("Building subtopic summary...")
 
-    # Sort by avg_citations descending
-    sorted_subtopics = sorted(subtopics, key=lambda s: s.avg_citations, reverse=True)
+    # Filter out single-paper outliers that would skew gap detection.
+    # A subtopic with only 1 paper but 3000+ citations is just a stray
+    # high-impact paper from another field, not a real gap.
+    filtered_subtopics = [
+        s for s in subtopics
+        if s.paper_count >= 2 or s.avg_citations < 500
+    ]
+
+    # Fall back to all subtopics if filtering removed too many
+    if len(filtered_subtopics) < 5:
+        filtered_subtopics = subtopics
+
+    # Sort by paper_count descending to surface the most represented areas
+    sorted_subtopics = sorted(filtered_subtopics, key=lambda s: s.paper_count, reverse=True)
 
     subtopic_summary = "\n".join(
         f"- {s.name}: {s.paper_count} papers, avg {s.avg_citations:.0f} citations ({s.pct_of_total:.1f}%)"
-        for s in sorted_subtopics[:15]  # Top 15 by citations
+        for s in sorted_subtopics[:15]  # Top 15 by paper count
     )
 
     # ── Step 2: Build trend summary ────────────────────────────────
@@ -64,17 +78,24 @@ def gap_detection_agent(
     # ── Step 4: Prompt Nemotron ───────────────────────────────────
     trace.log("Calling Nemotron for gap analysis...")
 
-    prompt = f"""You are a research gap analyst. Analyze these subtopics:
+    topic_context = f"Research domain: '{topic}'\n\n" if topic else ""
+
+    prompt = f"""You are a research gap analyst specializing in '{topic}'.
+
+{topic_context}These are the subtopics found in papers about '{topic}':
 {subtopic_summary}
 
-Year-by-year trends:
+Year-by-year publication trends:
 {trend_summary}
 
-Semantically isolated papers (potential gap indicators):
+Semantically isolated papers (emerging directions within '{topic}'):
 {orphan_titles}
 
-Identify top 3 gaps where citation demand is HIGH but publication supply is LOW.
-For each gap explain WHY it is a gap in 2 sentences.
+IMPORTANT: Identify the top 3 research gaps WITHIN the domain of '{topic}'.
+- Only report gaps directly relevant to '{topic}'
+- Ignore subtopics that are clearly from unrelated fields
+- A gap = high citation demand (many papers cite this area) but low publication supply (few papers exist)
+- For each gap explain WHY it is under-researched in 2 sentences
 
 Return ONLY valid JSON (no markdown):
 [{{"subtopic":"name","why_its_a_gap":"explanation","citation_demand":0.0,"publication_supply":0}}]"""
@@ -159,7 +180,8 @@ Return ONLY valid JSON (no markdown):
 def question_generation_agent(
     gaps: List[Gap],
     all_papers: List[Paper],
-    trace: AgentTrace
+    trace: AgentTrace,
+    topic: str = ""
 ) -> List[ResearchQuestion]:
     """Generate research questions for identified gaps.
 
@@ -167,6 +189,7 @@ def question_generation_agent(
         gaps: List of Gap objects from gap_detection_agent
         all_papers: All Paper objects fetched from OpenAlex
         trace: AgentTrace object for logging
+        topic: Original search topic for context-aware question generation
 
     Returns:
         List of ResearchQuestion objects
@@ -202,18 +225,23 @@ def question_generation_agent(
         # ── Step 3: Prompt Nemotron ───────────────────────────────
         trace.log(f"  Calling Nemotron for question generation...")
 
-        prompt = f"""You are a research strategist analyzing a gap in '{gap.subtopic}'.
+        topic_context = f"Overall research domain: '{topic}'\n" if topic else ""
+
+        prompt = f"""You are a research strategist analyzing a gap in the field of '{topic}'.
+{topic_context}
+Specific gap identified: '{gap.subtopic}'
 Why this is a gap: {gap.why_its_a_gap}
 
-ALL existing papers in this area:
+Existing papers in this gap area:
 {paper_list}
 
 Reason step by step:
 1. What assumption do ALL papers share that nobody has questioned?
 2. What would be TRUE if this assumption is WRONG?
 3. Generate 2 specific, falsifiable research questions that:
+   - Are directly relevant to '{topic}' and the gap '{gap.subtopic}'
    - Are NOT variations of existing work
-   - Address the assumption you found
+   - Address the shared assumption you found
    - Name a specific methodology
    - Are completable in a PhD thesis scope
 
@@ -376,11 +404,11 @@ def run_pipeline(topic: str, trace: Optional[AgentTrace] = None) -> Dict[str, An
 
     # ── Step 9: Gap detection ───────────────────────────────────
     trace.log("Phase 4: Detecting research gaps...")
-    gaps = gap_detection_agent(subtopics, trends, semantic_result, trace)
+    gaps = gap_detection_agent(subtopics, trends, semantic_result, trace, topic=topic_used)
 
     # ── Step 10: Question generation ────────────────────────────
     trace.log("Phase 5: Generating research questions...")
-    questions = question_generation_agent(gaps, papers, trace)
+    questions = question_generation_agent(gaps, papers, trace, topic=topic_used)
 
     # ── Step 11: Log completion ─────────────────────────────────
     trace.log(f"=== PaperGap complete ===")
