@@ -44,7 +44,8 @@ def fetch_papers(
     Returns:
         List of Paper objects with abstracts decoded from inverted index
     """
-    cache_dir = Path("cache")
+    # Use absolute path to cache directory (relative to this file's location)
+    cache_dir = Path(__file__).parent / "cache"
     cache_dir.mkdir(exist_ok=True)
 
     cache_file = cache_dir / f"{topic.replace(' ', '_')}_{years}.json"
