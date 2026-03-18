@@ -212,7 +212,7 @@ Output format (replace values, keep keys exact):
 [{{"subtopic":"exact name from list above","why_its_a_gap":"2 sentences explaining why demand exceeds supply in context of {topic}","citation_demand":0.0,"publication_supply":0}}]"""
 
     try:
-        response = ask(prompt, reasoning=False)
+        response = ask(prompt, reasoning=False, timeout=20.0)
         trace.log(f"Nemotron response received ({len(response)} chars)")
     except Exception as e:
         trace.log(f"Error calling Nemotron: {e}")
@@ -333,9 +333,9 @@ Name the methodology. Keep response short.
 Return ONLY JSON (no markdown):
 [{{"question":"str","methodology":"str","novelty_reason":"str"}}]"""
 
-    # ── Call Nemotron (reasoning=False for speed) ─────────────────
+    # ── Call Nemotron (reasoning=False, 15s timeout) ──────────────
     try:
-        response = ask(prompt, reasoning=False)
+        response = ask(prompt, reasoning=False, timeout=15.0)
     except Exception:
         response = None
 
@@ -496,9 +496,10 @@ def run_pipeline(topic: str, trace: Optional[AgentTrace] = None) -> Dict[str, An
     trace.log("Phase 2: Fetching publication trends...")
     trends = fetch_trends(topic_used, trace)
 
-    # ── Step 8: Semantic clustering ─────────────────────────────
+    # ── Step 8: Semantic clustering (top 100 by citations for speed) ─
     trace.log("Phase 3: Performing semantic clustering...")
-    semantic_result = semantic_cluster(papers, trace=trace)
+    papers_for_sem = sorted(papers, key=lambda p: p.citations, reverse=True)[:100]
+    semantic_result = semantic_cluster(papers_for_sem, trace=trace)
 
     # ── Step 9: Gap detection ───────────────────────────────────
     trace.log("Phase 4: Detecting research gaps...")
