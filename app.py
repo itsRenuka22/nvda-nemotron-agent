@@ -1,92 +1,158 @@
 #!/usr/bin/env python3
 """
-PaperGap Streamlit Application
-Identifies research gaps in academic literature and generates novel research questions
+PaperGap — Research Gap Identification Agent
 """
 
 import sys
 import os
-sys.path.insert(0, '/Users/renuka/Documents/Hackathon/NvidiaGTC/nvda-nemotron-agent/papergap')
-sys.path.insert(0, '/Users/renuka/Documents/Hackathon/NvidiaGTC/nvda-nemotron-agent')
+
+# Add papergap/ to path — all core modules (agents, tools, models, client) live there
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'papergap'))
 
 import streamlit as st
-from datetime import datetime
 import plotly.graph_objects as go
-import plotly.express as px
 
-# Import PaperGap pipeline
 from agents import run_pipeline
 from models import AgentTrace
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Page Configuration
+# Page config
 # ─────────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(
     page_title="PaperGap",
     page_icon="🔬",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Title & Description
+# CSS — fix sidebar width, card styles, thinking panel
 # ─────────────────────────────────────────────────────────────────────────────
 
-st.title("PaperGap — Research Gap Identification Agent")
-st.caption("Powered by NVIDIA Nemotron · Real papers from OpenAlex (250M+ works) · No API key required")
+st.markdown("""
+<style>
+/* Fix sidebar to a constant width */
+[data-testid="stSidebar"] {
+    min-width: 380px !important;
+    max-width: 380px !important;
+}
+
+/* Gap cards equal height feel */
+.gap-card-title {
+    font-size: 1.05rem;
+    font-weight: 700;
+    margin-bottom: 0.3rem;
+}
+
+/* Thinking panel */
+.thinking-step {
+    font-size: 0.92rem;
+    color: #aaa;
+    padding: 2px 0;
+}
+.thinking-step.active {
+    color: #fff;
+    font-weight: 600;
+}
+</style>
+""", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sidebar Controls
+# Live-progress trace — updates Streamlit placeholders as phases run
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _StreamlitTrace(AgentTrace):
+    """AgentTrace that mirrors phase transitions to Streamlit UI elements."""
+
+    _PHASES = [
+        ("Phase 1: Fetching",   "📡 Fetching papers from OpenAlex...",           10),
+        ("Phase 1c",            "🔬 Analysing cluster signals...",                 28),
+        ("Phase 2",             "📈 Loading publication trends...",               42),
+        ("Phase 3",             "🧠 Building semantic clusters...",               56),
+        ("Phase 4",             "🎯 Asking AI to identify research gaps...",      72),
+        ("Phase 5: Generating", "💡 Generating research questions...",            86),
+        ("Phase 5b",            "✨ Rewriting questions in plain English...",      95),
+        ("=== PaperGap complete", "✅ Done!",                                    100),
+    ]
+
+    def __init__(self, status_el, bar_el):
+        super().__init__()
+        self._status = status_el
+        self._bar = bar_el
+
+    def log(self, msg: str):
+        super().log(msg)
+        for prefix, label, pct in self._PHASES:
+            if prefix in msg:
+                self._status.markdown(f"*{label}*")
+                self._bar.progress(pct)
+                break
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Session state defaults
+# ─────────────────────────────────────────────────────────────────────────────
+
+if "topic_input" not in st.session_state:
+    st.session_state.topic_input = "federated learning rare disease diagnosis"
+if "pipeline_result" not in st.session_state:
+    st.session_state.pipeline_result = None
+if "last_topic_analyzed" not in st.session_state:
+    st.session_state.last_topic_analyzed = None
+
+# Apply any pending demo-button selection BEFORE the text_input widget is
+# rendered — Streamlit forbids writing to a keyed widget's state after it
+# has been instantiated in the same script run.
+if "_pending_topic" in st.session_state:
+    st.session_state.topic_input = st.session_state.pop("_pending_topic")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sidebar
 # ─────────────────────────────────────────────────────────────────────────────
 
 with st.sidebar:
     st.header("⚙️ Research Parameters")
 
-    # Topic input
+    # Topic input — keyed to session state so demo buttons can update it
     topic = st.text_input(
         "Research Topic",
-        value="federated learning rare disease diagnosis",
-        placeholder="Enter your research topic..."
+        key="topic_input",
+        placeholder="Enter your research topic...",
     )
 
-    # Year range selector
     year_range = st.selectbox(
         "Publication Years",
         ["2022-2025", "2021-2025", "2023-2025"],
-        index=0
+        index=0,
     )
 
-    # Demo topic quick-picks
+    # Demo quick-picks — clicking fills the topic box
     st.markdown("**Quick Pick Demo Topics:**")
-    cols = st.columns(3)
-
-    demo_topics = [
-        "federated learning\nrare disease\ndiagnosis",
+    demo_labels = [
+        "federated\nlearning rare\ndisease diagnosis",
         "large language\nmodels clinical\ndecision support",
-        "graph neural\nnetworks drug\ninteraction"
+        "graph neural\nnetworks drug\ninteraction",
     ]
-    demo_full = [
+    demo_values = [
         "federated learning rare disease diagnosis",
         "large language models clinical decision support",
-        "graph neural networks drug interaction prediction"
+        "graph neural networks drug interaction prediction",
     ]
-
+    cols = st.columns(3)
     for idx, col in enumerate(cols):
-        if col.button(demo_topics[idx], key=f"demo_{idx}", use_container_width=True):
-            topic = demo_full[idx]
-            # Clear old results when topic changes
+        if col.button(demo_labels[idx], key=f"demo_{idx}", use_container_width=True):
+            st.session_state._pending_topic = demo_values[idx]
             st.session_state.pipeline_result = None
+            st.session_state.last_topic_analyzed = None
             st.rerun()
 
-    # Main action button
     st.divider()
-    run_pipeline_btn = st.button(
+    run_btn = st.button(
         "🔍 Find Research Gaps",
         key="run_pipeline",
         type="primary",
         disabled=not topic.strip(),
-        use_container_width=True
+        use_container_width=True,
     )
 
     st.divider()
@@ -97,194 +163,172 @@ with st.sidebar:
         "• No authentication required"
     )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Initialize Session State
-# ─────────────────────────────────────────────────────────────────────────────
-
-if "pipeline_result" not in st.session_state:
-    st.session_state.pipeline_result = None
-
-if "is_running" not in st.session_state:
-    st.session_state.is_running = False
-
-if "last_topic_analyzed" not in st.session_state:
-    st.session_state.last_topic_analyzed = None
-
-# Clear results if user changed the topic
+# Clear stale results if topic changed since last run
 if topic.strip() != st.session_state.last_topic_analyzed:
     st.session_state.pipeline_result = None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main Content Area
+# Header
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Handle pipeline execution
-if run_pipeline_btn:
-    st.session_state.is_running = True
-
-    with st.spinner(f"🔄 Analyzing research gaps in '{topic}' ({year_range})..."):
-        try:
-            result = run_pipeline(topic)
-            st.session_state.pipeline_result = result
-            st.session_state.last_topic_analyzed = topic.strip()  # Track analyzed topic
-            st.session_state.is_running = False
-            st.success("✓ Pipeline completed successfully!")
-        except Exception as e:
-            st.session_state.is_running = False
-            st.error(f"Error running pipeline: {e}")
+st.title("PaperGap — Research Gap Identification Agent")
+st.caption("Powered by NVIDIA Nemotron · Real papers from OpenAlex (250M+ works)")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Section 1: AGENT TRACE (Execution Log)
+# Pipeline execution with live thinking display
+# ─────────────────────────────────────────────────────────────────────────────
+
+if run_btn:
+    thinking_box = st.container(border=True)
+    with thinking_box:
+        st.markdown("**🤔 Thinking...**")
+        status_el  = st.empty()
+        bar_el     = st.empty()
+        bar_el.progress(0)
+        status_el.markdown("*Starting up...*")
+
+    trace = _StreamlitTrace(status_el, bar_el)
+
+    try:
+        result = run_pipeline(topic, trace=trace)
+        st.session_state.pipeline_result = result
+        st.session_state.last_topic_analyzed = topic.strip()
+        # Replace the thinking box with a success message
+        thinking_box.empty()
+        st.success("✓ Analysis complete!")
+    except Exception as e:
+        thinking_box.empty()
+        st.error(f"Pipeline error: {e}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Results
 # ─────────────────────────────────────────────────────────────────────────────
 
 if st.session_state.pipeline_result:
     result = st.session_state.pipeline_result
 
+    # ── Agent trace (collapsed by default) ───────────────────────────────────
     with st.expander("📋 Agent Trace — Execution Log", expanded=False):
-        trace = result.get('trace')
-        if trace and hasattr(trace, 'steps'):
+        trace = result.get("trace")
+        if trace and hasattr(trace, "steps"):
             for log in trace.steps:
                 st.text(log)
         else:
-            st.text("No trace logs available")
+            st.text("No trace logs available.")
 
-    # ─────────────────────────────────────────────────────────────────────────────
-    # Section 2: Publication Landscape & Identified Gaps (Two Columns)
-    # ─────────────────────────────────────────────────────────────────────────────
-
-    col_left, col_right = st.columns(2)
-
-    with col_left:
-        st.subheader("📊 Publication Landscape")
-
-        # Bar chart: subtopics by paper count
-        subtopics = result.get('subtopics', [])
-        if subtopics:
-            subtopic_names = [s.name for s in subtopics[:10]]
-            paper_counts = [s.paper_count for s in subtopics[:10]]
-
-            fig = go.Figure(data=[
-                go.Bar(
-                    x=subtopic_names,
-                    y=paper_counts,
-                    marker=dict(color='#1f77b4'),
-                    text=paper_counts,
-                    textposition='auto',
-                )
-            ])
-
+    # ── Publication Landscape ─────────────────────────────────────────────────
+    st.subheader("📊 Publication Landscape")
+    subtopics = result.get("subtopics", [])
+    if subtopics:
+        col_chart, col_table = st.columns([3, 2])
+        with col_chart:
+            names  = [s.name for s in subtopics[:10]]
+            counts = [s.paper_count for s in subtopics[:10]]
+            fig = go.Figure(data=[go.Bar(
+                x=names, y=counts,
+                marker_color="#4C9BE8",
+                text=counts, textposition="auto",
+            )])
             fig.update_layout(
                 title="Papers by Subtopic (Top 10)",
                 xaxis_title="Subtopic",
                 yaxis_title="Number of Papers",
-                height=400,
+                height=360,
                 showlegend=False,
-                hovermode='x unified'
+                margin=dict(t=40, b=10),
+                hovermode="x unified",
             )
-
             st.plotly_chart(fig, use_container_width=True)
 
-            # Subtopic details table
-            st.caption("Subtopic Statistics")
-            subtopic_data = []
-            for s in subtopics[:5]:
-                subtopic_data.append({
-                    "Subtopic": s.name,
-                    "Papers": s.paper_count,
-                    "Avg Citations": f"{s.avg_citations:.1f}",
-                    "% of Total": f"{s.pct_of_total:.1f}%"
-                })
-            st.dataframe(subtopic_data, use_container_width=True, hide_index=True)
-
-    with col_right:
-        st.subheader("🎯 Identified Research Gaps")
-
-        gaps = result.get('gaps', [])
-        if gaps:
-            for i, gap in enumerate(gaps, 1):
-                with st.container(border=True):
-                    st.markdown(f"**Gap {i}: {gap.subtopic}**")
-                    st.metric(
-                        "Citation Demand",
-                        f"{gap.citation_demand:.0f}",
-                        delta=None
-                    )
-                    st.metric(
-                        "Publication Supply",
-                        f"{gap.publication_supply}",
-                        delta=None
-                    )
-                    st.write(f"**Why it's a gap:**")
-                    st.caption(gap.why_its_a_gap)
-
-                    if gap.shared_assumption:
-                        st.write(f"**Shared Assumption:**")
-                        st.caption(gap.shared_assumption)
-        else:
-            st.info("No gaps identified yet. Try a different topic.")
-
-    # ─────────────────────────────────────────────────────────────────────────────
-    # Section 3: Research Questions
-    # ─────────────────────────────────────────────────────────────────────────────
+        with col_table:
+            st.caption("Subtopic breakdown")
+            st.dataframe(
+                [{"Subtopic": s.name, "Papers": s.paper_count,
+                  "Avg Citations": f"{s.avg_citations:.1f}",
+                  "% of Total": f"{s.pct_of_total:.1f}%"}
+                 for s in subtopics[:6]],
+                use_container_width=True,
+                hide_index=True,
+            )
 
     st.divider()
+
+    # ── Research Gaps — horizontal cards ─────────────────────────────────────
+    st.subheader("🎯 Identified Research Gaps")
+
+    with st.expander("ℹ️ What do these numbers mean?", expanded=False):
+        st.markdown(
+            "**Avg Citations per Paper** — how often papers in this area are cited by other "
+            "researchers. High = the community finds this topic important.\n\n"
+            "**Papers in this area** — total papers found. When citations are high but paper "
+            "count is low (and few published recently), it signals a gap: demand exists but "
+            "supply hasn't caught up."
+        )
+
+    gaps = result.get("gaps", [])
+    if gaps:
+        gap_cols = st.columns(len(gaps))
+        for i, (gap, col) in enumerate(zip(gaps, gap_cols), 1):
+            with col:
+                with st.container(border=True):
+                    st.markdown(f"**Gap {i}**")
+                    st.markdown(f"##### {gap.subtopic}")
+                    st.divider()
+
+                    m1, m2 = st.columns(2)
+                    m1.metric("Avg Citations", f"{gap.citation_demand:.0f}")
+                    m2.metric("Papers", f"{gap.publication_supply}")
+
+                    st.markdown("**Why it's a gap:**")
+                    st.write(gap.why_its_a_gap)
+
+                    if gap.top_papers:
+                        st.markdown("**Key papers:**")
+                        for t in gap.top_papers[:2]:
+                            st.caption(f"• {t}")
+    else:
+        st.info("No gaps identified. Try a different or more specific topic.")
+
+    st.divider()
+
+    # ── Research Questions ────────────────────────────────────────────────────
     st.subheader("💡 Generated Research Questions")
 
-    questions = result.get('questions', [])
+    questions = result.get("questions", [])
     if questions:
         for i, q in enumerate(questions, 1):
-            with st.expander(
-                f"**Q{i}:** {q.question[:80]}...",
-                expanded=(i == 1)
-            ):
+            with st.expander(f"**Q{i}:** {q.question[:90]}{'...' if len(q.question) > 90 else ''}", expanded=(i == 1)):
                 st.markdown(f"**Research Gap:** {q.gap}")
                 st.markdown(f"**Full Question:** {q.question}")
-                st.markdown(f"**Proposed Methodology:** {q.methodology}")
-                st.markdown(f"**Why it's Novel:** {q.novelty_reason}")
-
+                st.markdown(f"**Suggested Approach:** {q.methodology}")
+                st.markdown(f"**Why it's new:** {q.novelty_reason}")
                 if q.foundational_papers:
                     st.markdown("**Foundational Papers:**")
-                    for paper in q.foundational_papers[:3]:
-                        st.caption(f"• {paper}")
+                    for p in q.foundational_papers[:3]:
+                        st.caption(f"• {p}")
     else:
         st.info("No research questions generated yet.")
 
-    # ─────────────────────────────────────────────────────────────────────────────
-    # Section 4: Footer Metrics
-    # ─────────────────────────────────────────────────────────────────────────────
-
     st.divider()
 
-    col1, col2, col3, col4, col5 = st.columns(5)
+    # ── Footer metrics ────────────────────────────────────────────────────────
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Papers Analyzed",    result.get("paper_count", 0))
+    c2.metric("Subtopics Found",    len(result.get("subtopics", [])))
+    c3.metric("Gaps Identified",    len(result.get("gaps", [])))
+    c4.metric("Questions Generated",len(result.get("questions", [])))
+    c5.metric("Drill-Down",         "Yes" if result.get("drilled_deeper") else "No")
 
-    with col1:
-        st.metric("Papers Analyzed", result.get('paper_count', 0))
-
-    with col2:
-        st.metric("Subtopics Found", len(result.get('subtopics', [])))
-
-    with col3:
-        st.metric("Gaps Identified", len(result.get('gaps', [])))
-
-    with col4:
-        st.metric("Questions Generated", len(result.get('questions', [])))
-
-    with col5:
-        drilled = "Yes" if result.get('drilled_deeper', False) else "No"
-        st.metric("Autonomous Drill-Down", drilled)
-
-    if result.get('drilled_deeper') and result.get('drill_reason'):
-        st.info(f"**Autonomous Analysis:** {result.get('drill_reason')}")
+    if result.get("drilled_deeper") and result.get("drill_reason"):
+        st.info(f"**Autonomous drill-down:** {result.get('drill_reason')}")
 
 else:
-    # Initial placeholder state
     st.info(
-        "👋 Welcome to PaperGap!\n\n"
-        "**How it works:**\n"
-        "1. Enter a research topic in the sidebar\n"
-        "2. Click 'Find Research Gaps' to analyze\n"
-        "3. Review identified gaps and generated research questions\n\n"
-        "Use the 'Quick Pick' buttons to try demo topics on healthcare + AI themes."
+        "👋 **Welcome to PaperGap!**\n\n"
+        "1. Enter a research topic in the sidebar (or click a Quick Pick)\n"
+        "2. Click **Find Research Gaps**\n"
+        "3. Watch the AI analyse papers and surface what's missing\n\n"
+        "Results include identified gaps, the papers behind them, and concrete research questions."
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -293,10 +337,8 @@ else:
 
 st.divider()
 st.markdown(
-    """
-    <div style='text-align: center; color: gray; font-size: 0.9em;'>
-    PaperGap v1.0 · NVIDIA Nemotron LLM · OpenAlex API · Hackathon 2025
-    </div>
-    """,
-    unsafe_allow_html=True
+    "<div style='text-align:center;color:gray;font-size:0.85em;'>"
+    "PaperGap · NVIDIA Nemotron · OpenAlex API · NVIDIA GTC Hackathon 2025"
+    "</div>",
+    unsafe_allow_html=True,
 )

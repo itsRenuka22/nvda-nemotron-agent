@@ -17,6 +17,7 @@ build/
 # IDE
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 *~
@@ -26,8 +27,13 @@ build/
 .env.local
 .env.*.local
 
-# Cache
+# Streamlit secrets (never commit real keys)
+.streamlit/secrets.toml
+
+# Cache directories
 cache/
+papergap/cache/
+tests/cache/
 *.cache
 .pytest_cache/
 

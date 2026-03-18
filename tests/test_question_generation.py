@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import sys
-sys.path.insert(0, '/Users/renuka/Documents/Hackathon/NvidiaGTC/nvda-nemotron-agent/papergap')
-sys.path.insert(0, '/Users/renuka/Documents/Hackathon/NvidiaGTC/nvda-nemotron-agent')
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'papergap'))
 
 from models import AgentTrace, Gap
 from tools import fetch_papers, cluster_by_topic

@@ -88,10 +88,34 @@ def _topic_overlap(gap_subtopic: str, paper_topic: str, threshold: float = 0.4) 
 def _is_relevant_to_search(subtopic_name: str, search_topic: str) -> bool:
     """True if subtopic shares at least one meaningful word with the search topic.
 
-    Filters out subtopics from completely unrelated domains (e.g. 'Pulmonary
-    Hypertension Research' when searching 'large language models').
+    Filters out subtopics from completely unrelated domains (e.g. 'RAFT in
+    Distributed Systems' when searching 'liposomes nanocarriers biomedical').
     """
     return len(_meaningful_words(subtopic_name) & _meaningful_words(search_topic)) >= 1
+
+
+def _subtopic_papers_match_domain(subtopic: "Subtopic", search_topic: str) -> bool:
+    """Check if a subtopic's PAPERS are actually about the search domain.
+
+    Uses paper titles as ground truth — an OpenAlex topic label like
+    'RAFT in Distributed Systems' might be assigned to a chemistry paper by
+    mistake, but the paper title will reveal the true domain.
+
+    Returns True if at least 1 paper title shares a meaningful word (prefix match)
+    with the search topic.
+    """
+    search_words = _meaningful_words(search_topic)
+    if not search_words or not subtopic.papers:
+        return True  # can't tell → keep it
+
+    for paper in subtopic.papers[:10]:  # check up to 10 papers
+        title_words = _meaningful_words(paper.title)
+        # Prefix match: "liposome" matches search word "liposomes", etc.
+        for tw in title_words:
+            for sw in search_words:
+                if tw.startswith(sw[:6]) or sw.startswith(tw[:6]):
+                    return True
+    return False
 
 
 def gap_detection_agent(
@@ -99,7 +123,8 @@ def gap_detection_agent(
     trends: List[TrendPoint],
     semantic_result: Dict[str, Any],
     trace: AgentTrace,
-    topic: str = ""
+    topic: str = "",
+    enrichment: Optional[Dict[str, Any]] = None,
 ) -> List[Gap]:
     """Detect research gaps using Nemotron analysis.
 
@@ -125,28 +150,89 @@ def gap_detection_agent(
     if len(filtered_subtopics) < 5:
         filtered_subtopics = subtopics
 
-    # Additionally filter by keyword relevance to the original search topic.
-    # This removes subtopics from completely unrelated domains (e.g. "Pulmonary
-    # Hypertension" when searching "large language models").
+    # Filter by domain relevance to the original search topic.
+    # Two-pass: first try label-based keyword match, then fall back to checking
+    # whether the subtopic's actual PAPER TITLES match the search domain.
+    # This catches cases like "RAFT in Distributed Systems" (label looks wrong)
+    # being assigned to liposome chemistry papers by OpenAlex.
     if topic:
-        relevant = [s for s in filtered_subtopics if _is_relevant_to_search(s.name, topic)]
-        # Only apply relevance filter if it leaves enough candidates
-        if len(relevant) >= 5:
+        # Pass 1: subtopic label shares a keyword with the search topic
+        label_match = [s for s in filtered_subtopics if _is_relevant_to_search(s.name, topic)]
+        # Pass 2: for subtopics whose label didn't match, check their paper titles
+        label_no_match = [s for s in filtered_subtopics if s not in label_match]
+        paper_match = [s for s in label_no_match if _subtopic_papers_match_domain(s, topic)]
+        relevant = label_match + paper_match
+
+        # Remove subtopics where NEITHER label nor papers match the domain
+        off_domain = [s for s in label_no_match if s not in paper_match]
+        if off_domain:
+            trace.log(
+                f"Relevance filter: removed {len(off_domain)} off-domain subtopics: "
+                + ", ".join(s.name for s in off_domain[:5])
+            )
+
+        if len(relevant) >= 2:
             filtered_subtopics = relevant
             trace.log(f"Relevance filter: kept {len(relevant)}/{len(subtopics)} subtopics related to '{topic}'")
+        elif len(relevant) == 1:
+            others = [s for s in filtered_subtopics if s not in relevant]
+            filtered_subtopics = relevant + sorted(others, key=_gap_score, reverse=True)[:3]
+            trace.log(f"Relevance filter: only 1 match — padded with {len(filtered_subtopics)-1} by gap_score")
+        else:
+            trace.log(f"Relevance filter: 0 matches for '{topic}' — using gap_score ranking only")
 
     # FIX 2: Sort by gap_score (citation intensity ÷ recent supply) instead of raw citations
     sorted_subtopics = sorted(filtered_subtopics, key=_gap_score, reverse=True)
     top_subtopics = sorted_subtopics[:15]
 
-    # Build summary with gap_score so Nemotron can reason about demand vs supply
-    subtopic_summary = "\n".join(
-        f"- {s.name}: {s.paper_count} papers, "
-        f"avg_citations={s.avg_citations:.0f}, "
-        f"recent_2024={sum(1 for p in s.papers if p.year >= 2024)}, "
-        f"gap_score={_gap_score(s):.1f}"
-        for s in top_subtopics
-    )
+    _enrich = enrichment or {}
+
+    # Build per-subtopic summary block including enrichment signals when available
+    subtopic_blocks: List[str] = []
+    for s in top_subtopics:
+        score = _gap_score(s)
+        recent_2024 = sum(1 for p in s.papers if p.year >= 2024)
+        sig = _enrich.get(s.name, {})
+
+        lines = [
+            f"Subtopic: {s.name}",
+            f"  papers={s.paper_count}, avg_citations={s.avg_citations:.0f}, "
+            f"recent_2024={recent_2024}, gap_score={score:.2f} "
+            f"(citations ÷ recent papers — higher = more demand)",
+        ]
+
+        # Signal 1 — explicit gap sentences from abstracts
+        gap_count = sig.get("explicit_gap_count", 0)
+        gap_sentences = sig.get("explicit_gap_sentences", [])
+        lines.append(
+            f"  explicit_gap_count: {gap_count} papers in this cluster state it as unsolved"
+        )
+        for qs in gap_sentences[:2]:
+            lines.append(f"    \"{qs[:120]}\"")
+
+        # Signal 2 — citation frontier
+        frontier_flag = sig.get("citation_frontier_flag", False)
+        frontier_papers = sig.get("frontier_papers", [])
+        frontier_label = "Yes" if frontier_flag else "No"
+        lines.append(
+            f"  citation_frontier: {frontier_label} — "
+            f"{len(frontier_papers)} foundational papers with no follow-up since 2022"
+        )
+        for fp in frontier_papers[:2]:
+            lines.append(f"    \"{fp['title'][:80]}\" ({fp['year']})")
+
+        # Signal 3 — concept isolation
+        iso_score = sig.get("concept_isolation_score", 0.0)
+        iso_concepts = sig.get("isolated_concepts", [])
+        concept_str = ", ".join(iso_concepts[:5]) if iso_concepts else "none"
+        lines.append(
+            f"  concept_isolation: {iso_score:.2f} — "
+            f"concepts unique to this cluster: {concept_str}"
+        )
+
+        subtopic_blocks.append("\n".join(lines))
+
+    subtopic_summary = "\n\n".join(subtopic_blocks)
 
     # FIX 1: Build exact name list Nemotron must choose from
     allowed_names = "\n".join(f"  - {s.name}" for s in top_subtopics)
@@ -208,8 +294,15 @@ STRICT RULES — violations will invalidate your response:
 4. Rank by gap_score (higher = better gap candidate).
 5. Return ONLY a JSON array. No explanation text before or after.
 
+For why_its_a_gap write 2-3 plain sentences that:
+- Name what researchers ARE currently studying in this area (reference actual paper titles or themes from the data)
+- Identify the SPECIFIC aspect that is missing or underexplored
+- Explain in simple terms why that gap matters to the field
+Do NOT use jargon like "citation intensity", "demand outpaces supply", or "underserved research need".
+Write as if explaining to a curious student, not a statistics report.
+
 Output format (replace values, keep keys exact):
-[{{"subtopic":"exact name from list above","why_its_a_gap":"2 sentences explaining why demand exceeds supply in context of {topic}","citation_demand":0.0,"publication_supply":0}}]"""
+[{{"subtopic":"exact name from list above","why_its_a_gap":"plain analytical explanation","citation_demand":0.0,"publication_supply":0}}]"""
 
     try:
         response = ask(prompt, reasoning=False, timeout=20.0)
@@ -220,6 +313,12 @@ Output format (replace values, keep keys exact):
 
     # ── Step 5: Parse JSON response ────────────────────────────────
     trace.log("Parsing gap analysis response...")
+
+    # Build a lookup: subtopic name → top 3 paper titles (by citations)
+    subtopic_top_papers: Dict[str, List[str]] = {}
+    for s in top_subtopics:
+        top3 = sorted(s.papers, key=lambda p: p.citations, reverse=True)[:3]
+        subtopic_top_papers[s.name] = [p.title for p in top3]
 
     gaps = []
 
@@ -257,6 +356,7 @@ Output format (replace values, keep keys exact):
                     citation_demand=float(gap_data.get("citation_demand", 0)),
                     publication_supply=int(gap_data.get("publication_supply", 0)),
                     orphan_papers=[p.title for p in orphans],
+                    top_papers=subtopic_top_papers.get(subtopic_val, []),
                 )
                 gaps.append(gap)
 
@@ -277,12 +377,23 @@ Output format (replace values, keep keys exact):
     for subtopic in top_subtopics[:3]:
         if subtopic.paper_count > 0:
             recent = sum(1 for p in subtopic.papers if p.year >= 2024)
+            # Pick top 2 paper titles by citations to make the explanation concrete
+            top_papers_fb = sorted(subtopic.papers, key=lambda p: p.citations, reverse=True)[:2]
+            paper_refs = " and ".join(f'"{p.title[:70]}"' for p in top_papers_fb)
+            recent_note = (
+                "but no new studies have appeared in 2024"
+                if recent == 0
+                else f"but only {recent} new {'study' if recent == 1 else 'studies'} appeared in 2024"
+            )
             gap = Gap(
                 subtopic=subtopic.name,
+                top_papers=[p.title for p in top_papers_fb],
                 why_its_a_gap=(
-                    f"High citation intensity ({subtopic.avg_citations:.0f} avg citations, "
-                    f"{subtopic.paper_count} papers) with only {recent} papers published in 2024. "
-                    f"Demand outpaces recent supply, indicating an underserved research need."
+                    f"Researchers have published {subtopic.paper_count} papers in this area "
+                    f"— including {paper_refs} — which together average {subtopic.avg_citations:.0f} "
+                    f"citations each, showing strong interest from the community. However, {recent_note}, "
+                    f"suggesting that while the community finds this topic important, new work addressing "
+                    f"open questions here is still missing."
                 ),
                 citation_demand=subtopic.avg_citations,
                 publication_supply=subtopic.paper_count,
@@ -363,15 +474,15 @@ Return ONLY JSON (no markdown):
         questions.append(ResearchQuestion(
             gap=gap.subtopic,
             question=(
-                f"Within '{topic}', what methodological approaches for "
-                f"{gap.subtopic.lower()} remain untested given citation demand "
-                f"({gap.citation_demand:.0f}) vs supply ({gap.publication_supply})?"
+                f"What aspects of {gap.subtopic.lower()} within {topic} "
+                f"have not been explored yet, and what would it take to study them?"
             ),
-            methodology="Systematic literature review + empirical validation",
+            methodology="Systematic literature review",
             foundational_papers=[p.title for p in top_papers[:2]],
             novelty_reason=(
-                f"High citation intensity on '{paper_hint[:60]}' signals "
-                f"unmet demand in {gap.subtopic} within {topic}."
+                f"Papers like '{paper_hint[:70]}' have attracted significant attention "
+                f"but the area of {gap.subtopic.lower()} still has open questions "
+                f"that newer studies haven't addressed."
             ),
         ))
 
@@ -398,13 +509,15 @@ def question_generation_agent(
         return ResearchQuestion(
             gap=gap.subtopic,
             question=(
-                f"Within '{topic}', what methodological approaches for "
-                f"{gap.subtopic.lower()} remain untested given citation demand "
-                f"({gap.citation_demand:.0f}) vs supply ({gap.publication_supply})?"
+                f"What aspects of {gap.subtopic.lower()} within {topic} "
+                f"have not been explored yet, and what would it take to study them?"
             ),
-            methodology="Systematic literature review + empirical validation",
+            methodology="Systematic literature review",
             foundational_papers=[],
-            novelty_reason=f"High citation intensity signals unmet demand in {gap.subtopic}.",
+            novelty_reason=(
+                f"This area of {gap.subtopic.lower()} has attracted strong research interest "
+                f"but recent publications have not kept up, leaving open questions unanswered."
+            ),
         )
 
     with ThreadPoolExecutor(max_workers=len(gaps)) as executor:
@@ -445,6 +558,75 @@ def question_generation_agent(
     return all_questions
 
 
+def question_clarity_agent(
+    questions: List[ResearchQuestion],
+    trace: AgentTrace,
+    topic: str = ""
+) -> List[ResearchQuestion]:
+    """Rewrite research questions in plain, student-accessible English.
+
+    Strips academic jargon ("methodological approaches", "empirical validation",
+    "citation demand", "publication supply") and rewrites questions so a curious
+    student can understand what is being asked and why it matters.
+
+    Makes a single Nemotron call to rewrite all questions at once.
+    Falls back to the originals on timeout or parse failure.
+    """
+    if not questions:
+        return questions
+
+    # Build a compact numbered list of the original questions
+    q_list = "\n".join(
+        f"{i}. {q.question}" for i, q in enumerate(questions, 1)
+    )
+
+    prompt = f"""You are a science communicator helping undergraduate students understand research gaps in '{topic}'.
+
+Rewrite each research question below so that:
+- A curious university student with no prior background can understand it
+- It sounds like a genuine, interesting question — not a template
+- It avoids jargon like "methodological approaches", "empirical validation", "citation demand", "publication supply", "falsifiable", "longitudinal"
+- It is specific to the actual topic, not generic
+- It stays as a question (ends with ?)
+
+Original questions:
+{q_list}
+
+Return ONLY a JSON array of rewritten question strings, one per original question, in the same order.
+Example format: ["Why do...", "What happens when...", "Can we..."]
+No markdown, no explanation."""
+
+    try:
+        response = ask(prompt, reasoning=False, timeout=20.0)
+        raw = _extract_json_array(response)
+        rewritten = json.loads(raw)
+
+        if not isinstance(rewritten, list) or len(rewritten) != len(questions):
+            trace.log(f"CLARITY: parse mismatch — using originals")
+            return questions
+
+        # Replace question text in-place, keep all other fields
+        clarified = []
+        for orig, new_text in zip(questions, rewritten):
+            if isinstance(new_text, str) and new_text.strip():
+                clarified.append(ResearchQuestion(
+                    gap=orig.gap,
+                    question=new_text.strip(),
+                    methodology=orig.methodology,
+                    foundational_papers=orig.foundational_papers,
+                    novelty_reason=orig.novelty_reason,
+                ))
+            else:
+                clarified.append(orig)
+
+        trace.log(f"CLARITY: rewrote {len(clarified)} questions in plain English")
+        return clarified
+
+    except Exception as e:
+        trace.log(f"CLARITY: failed ({e}) — using originals")
+        return questions
+
+
 def run_pipeline(topic: str, trace: Optional[AgentTrace] = None) -> Dict[str, Any]:
     """Run the complete PaperGap research gap analysis pipeline.
 
@@ -476,7 +658,7 @@ def run_pipeline(topic: str, trace: Optional[AgentTrace] = None) -> Dict[str, An
     trace.log(f"=== PaperGap starting for '{topic}' ===")
 
     # ── Step 3: Import tools inside function (avoid circular imports)
-    from tools import fetch_papers, fetch_trends, cluster_by_topic, semantic_cluster
+    from tools import fetch_papers, fetch_trends, cluster_by_topic, semantic_cluster, enrich_clusters
 
     # ── Step 4: Fetch papers and cluster by topic ───────────────
     trace.log(f"Phase 1: Fetching papers for '{topic}'...")
@@ -518,6 +700,15 @@ def run_pipeline(topic: str, trace: Optional[AgentTrace] = None) -> Dict[str, An
 
             trace.log(f"AUTONOMOUS: Drill-down complete. Now have {len(papers)} papers in {len(subtopics)} subtopics")
 
+    # ── Step 6b: Enrich clusters with additional gap signals ─────
+    trace.log("Phase 1c: Enriching clusters with gap signals...")
+    enrichment: Dict[str, Any] = {}
+    try:
+        enrichment = enrich_clusters(subtopics, papers)
+        trace.log(f"  Enrichment complete for {len(enrichment)} subtopics")
+    except Exception as e:
+        trace.log(f"  Enrichment failed ({e}) — continuing without enrichment")
+
     # ── Step 7: Fetch trends ────────────────────────────────────
     trace.log("Phase 2: Fetching publication trends...")
     trends = fetch_trends(topic_used, trace)
@@ -529,11 +720,15 @@ def run_pipeline(topic: str, trace: Optional[AgentTrace] = None) -> Dict[str, An
 
     # ── Step 9: Gap detection ───────────────────────────────────
     trace.log("Phase 4: Detecting research gaps...")
-    gaps = gap_detection_agent(subtopics, trends, semantic_result, trace, topic=topic_used)
+    gaps = gap_detection_agent(subtopics, trends, semantic_result, trace, topic=topic_used, enrichment=enrichment)
 
     # ── Step 10: Question generation ────────────────────────────
     trace.log("Phase 5: Generating research questions...")
     questions = question_generation_agent(gaps, papers, trace, topic=topic_used)
+
+    # ── Step 10b: Clarity rewrite ────────────────────────────────
+    trace.log("Phase 5b: Rewriting questions in plain English...")
+    questions = question_clarity_agent(questions, trace, topic=topic_used)
 
     # ── Step 11: Log completion ─────────────────────────────────
     trace.log(f"=== PaperGap complete ===")

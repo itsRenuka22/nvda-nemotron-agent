@@ -9,6 +9,7 @@ class Paper:
     year: int
     citations: int
     topics: List[str]
+    referenced_works: List[str] = field(default_factory=list)  # OpenAlex work IDs this paper cites
 
 @dataclass
 class Subtopic:
@@ -32,6 +33,7 @@ class Gap:
     publication_supply: int  # number of papers
     orphan_papers: List[str] = field(default_factory=list)
     shared_assumption: Optional[str] = None   # filled by Nemotron
+    top_papers: List[str] = field(default_factory=list)  # titles of top papers in this gap
 
 @dataclass
 class ResearchQuestion:

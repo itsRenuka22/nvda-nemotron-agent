@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 import time
@@ -142,7 +143,7 @@ def fetch_papers(
     results = all_results
     trace.log(f"Processing {len(results)} papers")
 
-    for i, item in enumerate(results):
+    for item in results:
         # Skip papers with empty abstracts
         abstract_inv_index = item.get('abstract_inverted_index')
         if not abstract_inv_index:
@@ -170,7 +171,77 @@ def fetch_papers(
         papers.append(paper)
 
     trace.log(f"Successfully created {len(papers)} Paper objects")
+
+    # ── Semantic relevance filter ────────────────────────────────────────
+    # Use SentenceTransformer cosine similarity to drop papers that are
+    # not actually about the search topic. Reuses the cached model so no
+    # extra load time after the first call.
+    papers = _filter_by_semantic_similarity(papers, topic, trace)
+
     return papers
+
+
+def _filter_by_semantic_similarity(
+    papers: List[Paper],
+    topic: str,
+    trace: AgentTrace,
+    threshold: float = 0.20,
+    min_papers: int = 10,
+) -> List[Paper]:
+    """Keep only papers whose abstract is semantically close to the search topic.
+
+    Computes cosine similarity between the topic embedding and each paper's
+    abstract embedding using the cached SentenceTransformer model.
+    Papers below `threshold` are dropped as off-domain.
+
+    Falls back to returning all papers if the model is unavailable or if
+    filtering would leave fewer than `min_papers`.
+    """
+    try:
+        import numpy as np
+        model = _get_sentence_model()
+    except ImportError:
+        trace.log("Semantic filter: skipped (sentence_transformers not installed)")
+        return papers
+
+    if not papers:
+        return papers
+
+    trace.log(f"Semantic filter: scoring {len(papers)} papers against '{topic[:60]}'...")
+
+    # Encode the topic once, then all abstracts in one batch (fast)
+    topic_emb = model.encode([topic], show_progress_bar=False)[0]
+    texts = [p.abstract if p.abstract else p.title for p in papers]
+    paper_embs = model.encode(texts, show_progress_bar=False)
+
+    # Cosine similarity = dot product of unit vectors (cast to float64 to avoid overflow)
+    topic_emb = topic_emb.astype(np.float64)
+    paper_embs = paper_embs.astype(np.float64)
+    topic_norm = topic_emb / (np.linalg.norm(topic_emb) + 1e-9)
+    paper_norms = paper_embs / (np.linalg.norm(paper_embs, axis=1, keepdims=True) + 1e-9)
+    scores = paper_norms @ topic_norm
+    # Replace any NaN/inf (bad embeddings) with 0 so they get filtered out
+    scores = np.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Pair each paper with its score for easier manipulation
+    scored = sorted(zip(scores.tolist(), papers), key=lambda x: x[0], reverse=True)
+
+    filtered = [(s, p) for s, p in scored if s >= threshold]
+
+    # Safety net: never return fewer than min_papers
+    if len(filtered) < min_papers:
+        filtered = scored[:min_papers]
+        trace.log(
+            f"Semantic filter: threshold too strict — keeping top {min_papers} "
+            f"by similarity (best={scored[0][0]:.2f}, worst kept={filtered[-1][0]:.2f})"
+        )
+    else:
+        trace.log(
+            f"Semantic filter: kept {len(filtered)}/{len(papers)} papers "
+            f"(threshold={threshold}, best={filtered[0][0]:.2f}, worst={filtered[-1][0]:.2f})"
+        )
+
+    return [p for _, p in filtered]
 
 
 def fetch_trends(
@@ -334,7 +405,7 @@ def semantic_cluster(
         }
 
     if trace:
-        trace.log(f"Loading SentenceTransformer model (cached)...")
+        trace.log("Loading SentenceTransformer model (cached)...")
 
     # Build text list: use abstract if exists, else title
     texts = [paper.abstract if paper.abstract else paper.title for paper in papers]
@@ -361,7 +432,7 @@ def semantic_cluster(
 
     # Find orphans: papers far from cluster centers
     if trace:
-        trace.log(f"Computing distances to identify orphan papers...")
+        trace.log("Computing distances to identify orphan papers...")
 
     # Compute distance from each point to its nearest cluster center
     distances = np.min(
@@ -388,6 +459,320 @@ def semantic_cluster(
         "orphans": orphans,
         "cluster_sizes": cluster_sizes
     }
+
+# ── Phrase lists for Signal 1 (explicit gap / limitation detection) ─────────
+_FUTURE_WORK_PHRASES = [
+    "future work", "will investigate", "we leave", "remains to be",
+    "open problem", "future research", "we plan to", "next step",
+    "an interesting direction", "left for future", "beyond the scope",
+    "remains open", "has not been studied", "not yet addressed",
+]
+
+_LIMITATION_PHRASES = [
+    "limitation", "we do not", "cannot handle", "does not support",
+    "we assume", "restricted to", "only applicable",
+    "does not consider", "out of scope", "we focus only",
+    "cannot be applied", "is not suitable", "we exclude",
+]
+
+
+def enrich_with_explicit_signals(
+    subtopics: List[Subtopic],
+    papers: List[Paper],
+) -> Dict[str, Any]:
+    """Count abstract sentences that explicitly state a limitation or future gap.
+
+    For each subtopic, scans its papers' abstracts for sentences matching
+    future-work or limitation phrases. Records the total match count and up
+    to 3 representative quote sentences as evidence for the Nemotron prompt.
+
+    Args:
+        subtopics: List of Subtopic objects from cluster_by_topic
+        papers: Full paper list (unused; subtopic.papers are used directly)
+
+    Returns:
+        Dict keyed by subtopic name:
+            {name: {"explicit_gap_count": int,
+                    "explicit_gap_sentences": list[str]}}
+    """
+    try:
+        result: Dict[str, Any] = {}
+
+        for subtopic in subtopics:
+            count = 0
+            quotes: List[str] = []
+
+            for paper in subtopic.papers:
+                if not paper.abstract:
+                    continue
+
+                # Split into sentences on period, exclamation mark, or question mark
+                sentences = re.split(r'[.!?]', paper.abstract)
+
+                for sentence in sentences:
+                    s_lower = sentence.lower().strip()
+                    if not s_lower:
+                        continue
+
+                    matched = (
+                        any(phrase in s_lower for phrase in _FUTURE_WORK_PHRASES)
+                        or any(phrase in s_lower for phrase in _LIMITATION_PHRASES)
+                    )
+
+                    if matched:
+                        count += 1
+                        if len(quotes) < 3:
+                            quotes.append(sentence.strip())
+
+            result[subtopic.name] = {
+                "explicit_gap_count": count,
+                "explicit_gap_sentences": quotes,
+            }
+
+        return result
+
+    except Exception as e:
+        warnings.warn(f"enrich_with_explicit_signals failed: {e}")
+        return {}
+
+
+def enrich_with_citation_frontier(
+    subtopics: List[Subtopic],
+    papers: List[Paper],
+) -> Dict[str, Any]:
+    """Detect foundational papers within each subtopic that have no follow-up after 2022.
+
+    Builds an intra-cluster directed citation graph using Paper.referenced_works.
+    Papers with in-degree >= 2 (cited by at least 2 cluster peers) whose most
+    recent citing paper was published <= 2022 are flagged as "frontier" papers —
+    influential work that appears to have stalled without follow-up.
+
+    Note: meaningful results require Paper.referenced_works to be populated.
+    When the field is empty (the current default from OpenAlex fetch), the graph
+    has no edges and citation_frontier_flag will be False for all subtopics.
+
+    Args:
+        subtopics: List of Subtopic objects from cluster_by_topic
+        papers: Full paper list (reserved for cross-cluster lookups)
+
+    Returns:
+        Dict keyed by subtopic name:
+            {name: {"citation_frontier_flag": bool,
+                    "frontier_papers": list[dict]}}
+    """
+    try:
+        import networkx as nx
+
+        result: Dict[str, Any] = {}
+
+        for subtopic in subtopics:
+            cluster_papers = subtopic.papers
+            # Build paper ID → Paper lookup for this cluster
+            id_to_paper: Dict[str, Paper] = {p.id: p for p in cluster_papers}
+
+            # Directed graph: edge A → B means paper A cites paper B
+            # Only edges where both A and B are in this cluster are included
+            G = nx.DiGraph()
+            G.add_nodes_from(id_to_paper.keys())
+
+            for paper in cluster_papers:
+                for ref_id in paper.referenced_works:
+                    if ref_id in id_to_paper:
+                        G.add_edge(paper.id, ref_id)
+
+            # Identify frontier papers: cited by >= 2 cluster papers,
+            # most recent citing paper published <= 2022
+            frontier_papers: List[Dict[str, Any]] = []
+
+            for node_id, in_deg in G.in_degree():
+                if in_deg < 2:
+                    continue
+
+                citing_years = [
+                    id_to_paper[pred].year
+                    for pred in G.predecessors(node_id)
+                    if pred in id_to_paper
+                ]
+                if not citing_years:
+                    continue
+
+                most_recent_citing = max(citing_years)
+                if most_recent_citing <= 2022:
+                    node_paper = id_to_paper[node_id]
+                    frontier_papers.append({
+                        "title": node_paper.title,
+                        "year": node_paper.year,
+                        "in_degree": in_deg,
+                    })
+
+            result[subtopic.name] = {
+                "citation_frontier_flag": len(frontier_papers) > 0,
+                "frontier_papers": frontier_papers,
+            }
+
+        return result
+
+    except ImportError:
+        warnings.warn("networkx not installed — skipping citation frontier enrichment")
+        return {}
+    except Exception as e:
+        warnings.warn(f"enrich_with_citation_frontier failed: {e}")
+        return {}
+
+
+def enrich_with_concept_isolation(
+    subtopics: List[Subtopic],
+    papers: List[Paper],
+) -> Dict[str, Any]:
+    """Measure how conceptually isolated each subtopic is from the rest of the corpus.
+
+    For each subtopic, computes the fraction of its concept set (OpenAlex topic
+    display names) that does not appear in papers outside that subtopic.
+    A score near 1.0 means this subtopic uses almost entirely unique concepts;
+    a score near 0.0 means its concepts are shared throughout the corpus.
+
+    Results are cached to disk keyed on an MD5 hash of all cluster paper IDs
+    to avoid repeating the O(n²) concept comparison on subsequent runs.
+
+    Args:
+        subtopics: List of Subtopic objects from cluster_by_topic
+        papers: Full paper list (used to compute corpus-wide concept frequencies)
+
+    Returns:
+        Dict keyed by subtopic name:
+            {name: {"concept_isolation_score": float,
+                    "isolated_concepts": list[str]}}
+    """
+    try:
+        # Build a stable cache key from the sorted union of all cluster paper IDs
+        all_ids = sorted(p.id for s in subtopics for p in s.papers)
+        cache_key = hashlib.md5("|".join(all_ids).encode()).hexdigest()
+        cache_dir = Path(__file__).parent / "cache"
+        cache_dir.mkdir(exist_ok=True)
+        cache_file = cache_dir / f"concept_isolation_{cache_key}.json"
+
+        if cache_file.exists():
+            with open(cache_file, 'r') as f:
+                return json.load(f)
+
+        # Corpus-wide frequency: how many papers in the full list use each concept
+        global_concept_freq: Dict[str, int] = {}
+        for paper in papers:
+            for concept in paper.topics:
+                if concept:
+                    global_concept_freq[concept] = global_concept_freq.get(concept, 0) + 1
+
+        result: Dict[str, Any] = {}
+
+        for subtopic in subtopics:
+            cluster_papers = subtopic.papers
+
+            # Frequency of each concept within this cluster
+            cluster_concept_freq: Dict[str, int] = {}
+            for paper in cluster_papers:
+                for concept in paper.topics:
+                    if concept:
+                        cluster_concept_freq[concept] = (
+                            cluster_concept_freq.get(concept, 0) + 1
+                        )
+
+            cluster_concepts = set(cluster_concept_freq.keys())
+
+            if not cluster_concepts:
+                result[subtopic.name] = {
+                    "concept_isolation_score": 0.0,
+                    "isolated_concepts": [],
+                }
+                continue
+
+            # corpus_concepts = concepts that appear in >= 1 paper OUTSIDE this cluster
+            corpus_concepts: set = set()
+            for concept in cluster_concepts:
+                outside_freq = (
+                    global_concept_freq.get(concept, 0)
+                    - cluster_concept_freq.get(concept, 0)
+                )
+                if outside_freq > 0:
+                    corpus_concepts.add(concept)
+
+            # overlap = concepts shared between this cluster and the rest of the corpus
+            overlap = cluster_concepts & corpus_concepts
+            isolation_score = 1.0 - (len(overlap) / len(cluster_concepts))
+
+            # isolated_concepts = concepts appearing in fewer than 2 papers outside this cluster
+            isolated_concepts = [
+                c for c in cluster_concepts
+                if (global_concept_freq.get(c, 0) - cluster_concept_freq.get(c, 0)) < 2
+            ]
+
+            result[subtopic.name] = {
+                "concept_isolation_score": round(isolation_score, 4),
+                "isolated_concepts": isolated_concepts[:10],  # cap for readability
+            }
+
+        # Persist to cache
+        with open(cache_file, 'w') as f:
+            json.dump(result, f, indent=2)
+
+        return result
+
+    except Exception as e:
+        warnings.warn(f"enrich_with_concept_isolation failed: {e}")
+        return {}
+
+
+def enrich_clusters(
+    subtopics: List[Subtopic],
+    papers: List[Paper],
+    adjacent_fields: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Orchestrate all three enrichment signals for a set of subtopics.
+
+    Calls enrich_with_explicit_signals, enrich_with_citation_frontier, and
+    enrich_with_concept_isolation in sequence. Each function is independently
+    fault-tolerant — a failure in one does not prevent the others from running.
+    Initialises every subtopic with safe zero-valued defaults before merging
+    results so callers always see all six signal keys regardless of failures.
+
+    Args:
+        subtopics: List of Subtopic objects from cluster_by_topic
+        papers: Full paper list from fetch_papers
+        adjacent_fields: Reserved for future cross-domain concept comparison
+
+    Returns:
+        Dict keyed by subtopic name with all three signal groups merged:
+            {name: {explicit_gap_count, explicit_gap_sentences,
+                    citation_frontier_flag, frontier_papers,
+                    concept_isolation_score, isolated_concepts}}
+    """
+    # Initialise safe defaults so every key is always present
+    result: Dict[str, Any] = {
+        s.name: {
+            "explicit_gap_count": 0,
+            "explicit_gap_sentences": [],
+            "citation_frontier_flag": False,
+            "frontier_papers": [],
+            "concept_isolation_score": 0.0,
+            "isolated_concepts": [],
+        }
+        for s in subtopics
+    }
+
+    for enrich_fn in (
+        enrich_with_explicit_signals,
+        enrich_with_citation_frontier,
+        enrich_with_concept_isolation,
+    ):
+        try:
+            signal_data = enrich_fn(subtopics, papers)
+            for name, data in signal_data.items():
+                if name in result:
+                    result[name].update(data)
+        except Exception as e:
+            warnings.warn(f"{enrich_fn.__name__} raised unexpectedly: {e}")
+
+    return result
+
 
 if __name__ == "__main__":
     from models import AgentTrace, Paper, Subtopic, TrendPoint
