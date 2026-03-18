@@ -252,4 +252,4 @@ python tests/test_semantic.py
 
 ---
 
-*Built for NVIDIA GTC Hackathon 2025*
+*Developed collaboratively for the NVIDIA GTC "Agents for Impact" Hackathon 2025*
