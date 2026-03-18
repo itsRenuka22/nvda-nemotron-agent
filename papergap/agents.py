@@ -312,30 +312,26 @@ def _questions_for_one_gap(
         matching = all_papers
 
     matching.sort(key=lambda p: p.citations, reverse=True)
-    top_papers = matching[:8]
+    top_papers = matching[:4]  # 4 papers max (was 8) — shorter prompt
 
-    # ── Build prompt ───────────────────────────────────────────────
-    paper_list = "\n\n".join(
-        f"{i}. {p.title}\n   {(p.abstract[:300] if p.abstract else '(No abstract)')}..."
+    # ── Build prompt (compact — titles + 80-char abstract snippet) ─
+    paper_list = "\n".join(
+        f"{i}. {p.title} ({p.citations} citations)"
         for i, p in enumerate(top_papers, 1)
-    ) or "(No papers found in this subtopic)"
+    ) or "(No papers)"
 
-    prompt = f"""You are a research strategist for the field of '{topic}'.
+    # Compact prompt — fewer tokens = faster response
+    prompt = f"""Field: '{topic}'. Gap: '{gap.subtopic}'.
+Gap reason: {gap.why_its_a_gap[:200]}
 
-Gap: '{gap.subtopic}'
-Why it's a gap: {gap.why_its_a_gap}
-
-Relevant papers:
+Top papers in this gap:
 {paper_list}
 
-Generate 2 specific, falsifiable research questions that:
-- Are directly relevant to '{topic}' and '{gap.subtopic}'
-- Challenge an assumption shared by all papers above
-- Name a specific methodology
-- Are completable in a PhD thesis
+Generate 1 specific falsifiable research question relevant to '{topic}' and '{gap.subtopic}'.
+Name the methodology. Keep response short.
 
-Return ONLY a JSON array (no markdown, no other text):
-[{{"question":"str","methodology":"str","foundational_papers":["title"],"novelty_reason":"str","shared_assumption":"str"}}]"""
+Return ONLY JSON (no markdown):
+[{{"question":"str","methodology":"str","novelty_reason":"str"}}]"""
 
     # ── Call Nemotron (reasoning=False for speed) ─────────────────
     try:
@@ -348,18 +344,16 @@ Return ONLY a JSON array (no markdown, no other text):
     if response:
         try:
             data = json.loads(_extract_json_array(response))
-            for i, q in enumerate(data):
+            for q in data:
                 if not isinstance(q, dict):
                     continue
                 questions.append(ResearchQuestion(
                     gap=gap.subtopic,
                     question=q.get("question", ""),
                     methodology=q.get("methodology", ""),
-                    foundational_papers=q.get("foundational_papers", []),
+                    foundational_papers=[p.title for p in top_papers[:2]],
                     novelty_reason=q.get("novelty_reason", ""),
                 ))
-                if i == 0 and q.get("shared_assumption"):
-                    gap.shared_assumption = q["shared_assumption"]
         except (json.JSONDecodeError, KeyError, ValueError, TypeError):
             pass
 
@@ -369,16 +363,15 @@ Return ONLY a JSON array (no markdown, no other text):
         questions.append(ResearchQuestion(
             gap=gap.subtopic,
             question=(
-                f"Within the field of {topic}, how does {gap.subtopic.lower()} "
-                f"affect outcomes — and what methodological approaches remain untested "
-                f"given citation demand ({gap.citation_demand:.0f}) vs "
-                f"publication supply ({gap.publication_supply})?"
+                f"Within '{topic}', what methodological approaches for "
+                f"{gap.subtopic.lower()} remain untested given citation demand "
+                f"({gap.citation_demand:.0f}) vs supply ({gap.publication_supply})?"
             ),
-            methodology="Systematic literature review followed by empirical validation",
-            foundational_papers=[p.title for p in top_papers[:3]],
+            methodology="Systematic literature review + empirical validation",
+            foundational_papers=[p.title for p in top_papers[:2]],
             novelty_reason=(
-                f"High citation intensity on '{paper_hint[:60]}' signals strong community "
-                f"interest in {gap.subtopic} within {topic}, yet recent output is low."
+                f"High citation intensity on '{paper_hint[:60]}' signals "
+                f"unmet demand in {gap.subtopic} within {topic}."
             ),
         ))
 
