@@ -336,6 +336,13 @@ def semantic_cluster(
     # Encode texts
     embeddings = model.encode(texts, show_progress_bar=False)
 
+    # Cap clusters to number of papers (KMeans requires n_samples >= n_clusters)
+    n_clusters = min(n_clusters, len(papers))
+    if n_clusters < 2:
+        if trace:
+            trace.log("Too few papers for clustering — skipping semantic cluster")
+        return {"labels": [], "orphans": [], "cluster_sizes": {}}
+
     if trace:
         trace.log(f"Running KMeans clustering with {n_clusters} clusters...")
 
