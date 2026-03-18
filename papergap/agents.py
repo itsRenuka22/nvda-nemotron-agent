@@ -212,7 +212,7 @@ Output format (replace values, keep keys exact):
 [{{"subtopic":"exact name from list above","why_its_a_gap":"2 sentences explaining why demand exceeds supply in context of {topic}","citation_demand":0.0,"publication_supply":0}}]"""
 
     try:
-        response = ask(prompt, reasoning=True)
+        response = ask(prompt, reasoning=False)
         trace.log(f"Nemotron response received ({len(response)} chars)")
     except Exception as e:
         trace.log(f"Error calling Nemotron: {e}")
