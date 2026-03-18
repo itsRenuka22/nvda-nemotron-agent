@@ -118,7 +118,7 @@ Each signal adds a layer of evidence to support or refute each subtopic being a 
 |--------|----------|-----------------|
 | **Explicit Gap Mentions** | `enrich_with_explicit_signals` | Abstracts containing future-work or limitation phrases — *"future work"*, *"remains unexplored"*, *"our method does not handle"*, etc. |
 | **Citation Frontier** | `enrich_with_citation_frontier` | Foundational papers cited by ≥2 others in the cluster, with no follow-up work after 2022 — high demand, stalled supply |
-| **Concept Isolation** | `enrich_with_concept_isolation` | Concepts unique to one cluster vs the whole corpus. High isolation score = niche area with little cross-pollination |
+| **Concept Isolation** | `enrich_with_concept_isolation` | Concepts unique to one cluster vs the whole corpus. High isolation score = niche area confined to a single cluster with little presence in the broader corpus |
 
 Concept isolation results are cached to `papergap/cache/concept_isolation_<md5>.json` to avoid recomputation across runs.
 
