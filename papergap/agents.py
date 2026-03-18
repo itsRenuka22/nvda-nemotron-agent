@@ -228,13 +228,31 @@ Output format (replace values, keep keys exact):
             cleaned = _extract_json_array(response)
             gaps_data = json.loads(cleaned)
 
+            # Template placeholder values Nemotron sometimes returns verbatim
+            _PLACEHOLDERS = {
+                'exact name', 'unknown', 'str', 'name', 'subtopic name',
+                'subtopic', 'gap name', 'example', 'placeholder',
+            }
+
             for gap_data in gaps_data:
                 if not isinstance(gap_data, dict):
                     trace.log(f"Skipping invalid gap entry (not a dict): {type(gap_data)}")
                     continue
+
+                subtopic_val = gap_data.get("subtopic", "").strip()
+                why_val = gap_data.get("why_its_a_gap", "").strip()
+
+                # Detect template echoes (Nemotron returned the example values)
+                if subtopic_val.lower() in _PLACEHOLDERS:
+                    trace.log(f"Skipping template placeholder gap: '{subtopic_val}'")
+                    continue
+                if why_val.lower() in {'2 sentences', '2 sentence explanation', 'explanation', 'str'}:
+                    trace.log(f"Skipping template placeholder why_its_a_gap")
+                    continue
+
                 gap = Gap(
-                    subtopic=gap_data.get("subtopic", "Unknown"),
-                    why_its_a_gap=gap_data.get("why_its_a_gap", ""),
+                    subtopic=subtopic_val,
+                    why_its_a_gap=why_val,
                     citation_demand=float(gap_data.get("citation_demand", 0)),
                     publication_supply=int(gap_data.get("publication_supply", 0)),
                     orphan_papers=[p.title for p in orphans],
