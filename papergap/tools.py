@@ -285,6 +285,18 @@ def cluster_by_topic(papers: List[Paper], trace: AgentTrace) -> List[Subtopic]:
     return subtopics
 
 
+# Module-level model cache — loaded once, reused across all pipeline runs
+_sentence_model = None
+
+
+def _get_sentence_model():
+    global _sentence_model
+    if _sentence_model is None:
+        from sentence_transformers import SentenceTransformer
+        _sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+    return _sentence_model
+
+
 def semantic_cluster(
     papers: List[Paper],
     n_clusters: int = 7,
@@ -307,9 +319,9 @@ def semantic_cluster(
             - "cluster_sizes": Dict mapping cluster label to paper count
     """
     try:
-        from sentence_transformers import SentenceTransformer
         from sklearn.cluster import KMeans
         import numpy as np
+        model = _get_sentence_model()
     except ImportError as e:
         warning_msg = f"Missing dependencies for semantic clustering: {e}"
         warnings.warn(warning_msg)
@@ -322,10 +334,7 @@ def semantic_cluster(
         }
 
     if trace:
-        trace.log(f"Loading SentenceTransformer model...")
-
-    # Load model
-    model = SentenceTransformer('all-MiniLM-L6-v2')
+        trace.log(f"Loading SentenceTransformer model (cached)...")
 
     # Build text list: use abstract if exists, else title
     texts = [paper.abstract if paper.abstract else paper.title for paper in papers]

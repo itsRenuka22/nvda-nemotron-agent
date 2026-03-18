@@ -1,5 +1,6 @@
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional
 from client import ask
 from models import Gap, Subtopic, TrendPoint, AgentTrace, Paper, ResearchQuestion
@@ -293,160 +294,134 @@ Output format (replace values, keep keys exact):
     return fallback_gaps
 
 
+def _questions_for_one_gap(
+    gap: Gap,
+    all_papers: List[Paper],
+    topic: str,
+) -> List[ResearchQuestion]:
+    """Generate research questions for a single gap (runs in a thread)."""
+
+    # ── Find matching papers ───────────────────────────────────────
+    matching = [p for p in all_papers if p.topics and p.topics[0] == gap.subtopic]
+    if not matching:
+        matching = [
+            p for p in all_papers
+            if p.topics and any(_topic_overlap(gap.subtopic, t) for t in p.topics[:3])
+        ]
+    if not matching:
+        matching = all_papers
+
+    matching.sort(key=lambda p: p.citations, reverse=True)
+    top_papers = matching[:8]
+
+    # ── Build prompt ───────────────────────────────────────────────
+    paper_list = "\n\n".join(
+        f"{i}. {p.title}\n   {(p.abstract[:300] if p.abstract else '(No abstract)')}..."
+        for i, p in enumerate(top_papers, 1)
+    ) or "(No papers found in this subtopic)"
+
+    prompt = f"""You are a research strategist for the field of '{topic}'.
+
+Gap: '{gap.subtopic}'
+Why it's a gap: {gap.why_its_a_gap}
+
+Relevant papers:
+{paper_list}
+
+Generate 2 specific, falsifiable research questions that:
+- Are directly relevant to '{topic}' and '{gap.subtopic}'
+- Challenge an assumption shared by all papers above
+- Name a specific methodology
+- Are completable in a PhD thesis
+
+Return ONLY a JSON array (no markdown, no other text):
+[{{"question":"str","methodology":"str","foundational_papers":["title"],"novelty_reason":"str","shared_assumption":"str"}}]"""
+
+    # ── Call Nemotron (reasoning=False for speed) ─────────────────
+    try:
+        response = ask(prompt, reasoning=False)
+    except Exception:
+        response = None
+
+    # ── Parse response ─────────────────────────────────────────────
+    questions = []
+    if response:
+        try:
+            data = json.loads(_extract_json_array(response))
+            for i, q in enumerate(data):
+                if not isinstance(q, dict):
+                    continue
+                questions.append(ResearchQuestion(
+                    gap=gap.subtopic,
+                    question=q.get("question", ""),
+                    methodology=q.get("methodology", ""),
+                    foundational_papers=q.get("foundational_papers", []),
+                    novelty_reason=q.get("novelty_reason", ""),
+                ))
+                if i == 0 and q.get("shared_assumption"):
+                    gap.shared_assumption = q["shared_assumption"]
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError):
+            pass
+
+    # ── Fallback if nothing parsed ─────────────────────────────────
+    if not questions:
+        paper_hint = top_papers[0].title if top_papers else gap.subtopic
+        questions.append(ResearchQuestion(
+            gap=gap.subtopic,
+            question=(
+                f"Within the field of {topic}, how does {gap.subtopic.lower()} "
+                f"affect outcomes — and what methodological approaches remain untested "
+                f"given citation demand ({gap.citation_demand:.0f}) vs "
+                f"publication supply ({gap.publication_supply})?"
+            ),
+            methodology="Systematic literature review followed by empirical validation",
+            foundational_papers=[p.title for p in top_papers[:3]],
+            novelty_reason=(
+                f"High citation intensity on '{paper_hint[:60]}' signals strong community "
+                f"interest in {gap.subtopic} within {topic}, yet recent output is low."
+            ),
+        ))
+
+    return questions
+
+
 def question_generation_agent(
     gaps: List[Gap],
     all_papers: List[Paper],
     trace: AgentTrace,
     topic: str = ""
 ) -> List[ResearchQuestion]:
-    """Generate research questions for identified gaps.
+    """Generate research questions for all gaps in parallel (3× faster).
 
-    Args:
-        gaps: List of Gap objects from gap_detection_agent
-        all_papers: All Paper objects fetched from OpenAlex
-        trace: AgentTrace object for logging
-        topic: Original search topic for context-aware question generation
-
-    Returns:
-        List of ResearchQuestion objects
+    Spawns one thread per gap so all Nemotron calls run simultaneously.
+    Uses reasoning=False for speed — gap detection already did the deep thinking.
     """
+    trace.log(f"Generating questions for {len(gaps)} gaps in parallel...")
 
-    all_questions = []
+    # Order-preserving parallel execution
+    all_questions: List[ResearchQuestion] = []
+    results: Dict[int, List[ResearchQuestion]] = {}
 
-    for gap in gaps:
-        trace.log(f"Generating questions for gap: {gap.subtopic}")
-
-        # ── Step 1: Find papers matching gap.subtopic ──────────────
-        # Try exact match first (works when Nemotron followed the constraint)
-        matching_papers = [
-            p for p in all_papers
-            if p.topics and p.topics[0] == gap.subtopic
-        ]
-
-        # FIX 1: Fuzzy word-overlap fallback across top 3 topics per paper
-        if not matching_papers:
-            matching_papers = [
-                p for p in all_papers
-                if p.topics and any(
-                    _topic_overlap(gap.subtopic, t) for t in p.topics[:3]
-                )
-            ]
-            if matching_papers:
-                trace.log(f"  Fuzzy match found {len(matching_papers)} papers for '{gap.subtopic}'")
-
-        # Last resort: use all papers — Nemotron still has full topic context in prompt
-        if not matching_papers:
-            matching_papers = all_papers
-            trace.log(f"  No topic match — using all {len(all_papers)} papers as context")
-
-        # Sort by citations descending, take top 8
-        matching_papers.sort(key=lambda p: p.citations, reverse=True)
-        top_papers = matching_papers[:8]
-
-        trace.log(f"  Found {len(matching_papers)} papers, using top {len(top_papers)}")
-
-        # ── Step 2: Build paper list for prompt ────────────────────
-        paper_list = ""
-        for i, paper in enumerate(top_papers, 1):
-            # First 300 chars of abstract
-            abstract_snippet = paper.abstract[:300] if paper.abstract else "(No abstract)"
-            paper_list += f"{i}. {paper.title}\n   {abstract_snippet}...\n\n"
-
-        if not paper_list:
-            paper_list = "(No papers found in this subtopic)"
-
-        # ── Step 3: Prompt Nemotron ───────────────────────────────
-        trace.log(f"  Calling Nemotron for question generation...")
-
-        topic_context = f"Overall research domain: '{topic}'\n" if topic else ""
-
-        prompt = f"""You are a research strategist analyzing a gap in the field of '{topic}'.
-{topic_context}
-Specific gap identified: '{gap.subtopic}'
-Why this is a gap: {gap.why_its_a_gap}
-
-Existing papers in this gap area:
-{paper_list}
-
-Reason step by step:
-1. What assumption do ALL papers share that nobody has questioned?
-2. What would be TRUE if this assumption is WRONG?
-3. Generate 2 specific, falsifiable research questions that:
-   - Are directly relevant to '{topic}' and the gap '{gap.subtopic}'
-   - Are NOT variations of existing work
-   - Address the shared assumption you found
-   - Name a specific methodology
-   - Are completable in a PhD thesis scope
-
-Cite WHICH paper reveals this assumption.
-
-Return ONLY valid JSON:
-[{{"question":"str","methodology":"str","foundational_papers":["title"],"novelty_reason":"str","shared_assumption":"str"}}]"""
-
-        try:
-            response = ask(prompt, reasoning=True)
-            trace.log(f"  Nemotron response received ({len(response)} chars)")
-        except Exception as e:
-            trace.log(f"  Error calling Nemotron: {e}")
-            response = None
-
-        # ── Step 4: Parse JSON response ────────────────────────────
-        trace.log(f"  Parsing question generation response...")
-
-        questions_for_gap = []
-
-        if response:
+    with ThreadPoolExecutor(max_workers=len(gaps)) as executor:
+        futures = {
+            executor.submit(_questions_for_one_gap, gap, all_papers, topic): idx
+            for idx, gap in enumerate(gaps)
+        }
+        for future in as_completed(futures):
+            idx = futures[future]
+            gap = gaps[idx]
             try:
-                # FIX 6: Robust bracket-matching extraction
-                cleaned = _extract_json_array(response)
-                questions_data = json.loads(cleaned)
+                qs = future.result()
+                results[idx] = qs
+                tag = "fallback" if (len(qs) == 1 and "untested" in qs[0].question) else "specific"
+                trace.log(f"QUESTIONS: {len(qs)} [{tag}] for '{gap.subtopic}'")
+            except Exception as e:
+                trace.log(f"QUESTIONS: error for '{gap.subtopic}': {e}")
+                results[idx] = []
 
-                # Create ResearchQuestion objects
-                for i, q_data in enumerate(questions_data):
-                    if not isinstance(q_data, dict):
-                        trace.log(f"  Skipping invalid question entry (not a dict): {type(q_data)}")
-                        continue
-                    question = ResearchQuestion(
-                        gap=gap.subtopic,
-                        question=q_data.get("question", ""),
-                        methodology=q_data.get("methodology", ""),
-                        foundational_papers=q_data.get("foundational_papers", []),
-                        novelty_reason=q_data.get("novelty_reason", ""),
-                    )
-                    questions_for_gap.append(question)
-                    if i == 0 and q_data.get("shared_assumption"):
-                        gap.shared_assumption = q_data.get("shared_assumption")
-
-                if questions_for_gap:
-                    trace.log(f"QUESTIONS: generated {len(questions_for_gap)} questions for '{gap.subtopic}'")
-                    all_questions.extend(questions_for_gap)
-                    continue  # skip fallback for this gap
-
-                # JSON parsed but all entries were non-dicts — fall through to fallback
-                trace.log(f"  No valid question dicts — using fallback for '{gap.subtopic}'")
-
-            except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
-                trace.log(f"  JSON parsing failed: {e}, using fallback")
-
-        # Fallback: derive a specific question from gap stats and paper titles
-        paper_hint = top_papers[0].title if top_papers else gap.subtopic
-        fallback_question = ResearchQuestion(
-            gap=gap.subtopic,
-            question=(
-                f"Within the field of {topic}, how does {gap.subtopic.lower()} "
-                f"affect outcomes — and what methodological approaches remain untested "
-                f"given the current citation demand ({gap.citation_demand:.0f}) "
-                f"versus publication supply ({gap.publication_supply})?"
-            ),
-            methodology="Systematic literature review followed by empirical validation study",
-            foundational_papers=[p.title for p in top_papers[:3]],
-            novelty_reason=(
-                f"High citation intensity on '{paper_hint[:60]}' signals strong community "
-                f"interest in {gap.subtopic} within {topic}, yet recent output is low."
-            ),
-        )
-        all_questions.append(fallback_question)
-        trace.log(f"QUESTIONS: generated 1 question for '{gap.subtopic}' (fallback)")
+    # Reassemble in gap order
+    for idx in range(len(gaps)):
+        all_questions.extend(results.get(idx, []))
 
     return all_questions
 
