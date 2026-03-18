@@ -1,6 +1,6 @@
 import json
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 from typing import List, Dict, Any, Optional
 from client import ask
 from models import Gap, Subtopic, TrendPoint, AgentTrace, Paper, ResearchQuestion
@@ -389,30 +389,56 @@ def question_generation_agent(
     Spawns one thread per gap so all Nemotron calls run simultaneously.
     Uses reasoning=False for speed — gap detection already did the deep thinking.
     """
-    trace.log(f"Generating questions for {len(gaps)} gaps in parallel...")
+    PARALLEL_TIMEOUT = 20  # hard wall: abandon slow calls after this many seconds
+    trace.log(f"Generating questions for {len(gaps)} gaps in parallel (max {PARALLEL_TIMEOUT}s)...")
 
-    # Order-preserving parallel execution
-    all_questions: List[ResearchQuestion] = []
     results: Dict[int, List[ResearchQuestion]] = {}
 
+    def _fallback_q(gap: Gap) -> ResearchQuestion:
+        return ResearchQuestion(
+            gap=gap.subtopic,
+            question=(
+                f"Within '{topic}', what methodological approaches for "
+                f"{gap.subtopic.lower()} remain untested given citation demand "
+                f"({gap.citation_demand:.0f}) vs supply ({gap.publication_supply})?"
+            ),
+            methodology="Systematic literature review + empirical validation",
+            foundational_papers=[],
+            novelty_reason=f"High citation intensity signals unmet demand in {gap.subtopic}.",
+        )
+
     with ThreadPoolExecutor(max_workers=len(gaps)) as executor:
-        futures = {
+        future_to_idx = {
             executor.submit(_questions_for_one_gap, gap, all_papers, topic): idx
             for idx, gap in enumerate(gaps)
         }
-        for future in as_completed(futures):
-            idx = futures[future]
+
+        # Wait up to PARALLEL_TIMEOUT seconds — don't block forever on slow calls
+        done, not_done = futures_wait(future_to_idx, timeout=PARALLEL_TIMEOUT)
+
+        # Collect results from futures that finished in time
+        for future in done:
+            idx = future_to_idx[future]
             gap = gaps[idx]
             try:
                 qs = future.result()
                 results[idx] = qs
-                tag = "fallback" if (len(qs) == 1 and "untested" in qs[0].question) else "specific"
+                tag = "fallback" if "untested" in qs[0].question else "specific"
                 trace.log(f"QUESTIONS: {len(qs)} [{tag}] for '{gap.subtopic}'")
             except Exception as e:
                 trace.log(f"QUESTIONS: error for '{gap.subtopic}': {e}")
-                results[idx] = []
+                results[idx] = [_fallback_q(gap)]
+
+        # Generate instant fallbacks for any calls that timed out
+        for future in not_done:
+            future.cancel()
+            idx = future_to_idx[future]
+            gap = gaps[idx]
+            trace.log(f"QUESTIONS: timeout — fallback for '{gap.subtopic}'")
+            results[idx] = [_fallback_q(gap)]
 
     # Reassemble in gap order
+    all_questions: List[ResearchQuestion] = []
     for idx in range(len(gaps)):
         all_questions.extend(results.get(idx, []))
 
