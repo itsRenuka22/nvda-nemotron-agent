@@ -1,6 +1,7 @@
 # PaperGap — Research Gap Identification Agent
 
-> **NVIDIA GTC Hackathon 2025** · Powered by NVIDIA Nemotron · Real papers from OpenAlex (250M+ works)
+
+> Developed collaboratively for the **NVIDIA GTC Agents for Impact Hackathon 2026** · Powered by NVIDIA Nemotron
 
 PaperGap is an AI agent that takes any research topic, fetches real academic papers, clusters them semantically, and uses NVIDIA's Nemotron LLM to surface **underexplored research gaps** and generate **concrete, novel research questions** — in plain English.
 
@@ -252,4 +253,10 @@ python tests/test_semantic.py
 
 ---
 
-*Developed collaboratively for the NVIDIA GTC "Agents for Impact" Hackathon 2026*
+## Team
+
+Built with ❤️ at the NVIDIA Agents for Impact Hackathon @ SJSU
+
+- [Renuka Prasad Patwari](https://github.com/itsRenuka22)
+- [Sonali Lonkar](https://github.com/sonalilonkar1)
+- [Aakruti Beladiya](https://github.com/aakrutibeladiya)
