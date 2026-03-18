@@ -62,21 +62,35 @@ def _gap_score(subtopic: Subtopic) -> float:
     return citation_intensity * supply_gap_factor
 
 
+_STOP_WORDS = {'and', 'or', 'the', 'in', 'of', 'for', 'to', 'a', 'an', 'with', 'using',
+               'based', 'via', 'through', 'by', 'on', 'at', 'from', 'its', 'their'}
+
+
+def _meaningful_words(text: str) -> set:
+    return {w.lower() for w in text.split() if w.lower() not in _STOP_WORDS and len(w) > 2}
+
+
 def _topic_overlap(gap_subtopic: str, paper_topic: str, threshold: float = 0.4) -> bool:
     """True if gap subtopic and paper topic share enough meaningful words.
 
     Used as fuzzy fallback when Nemotron generates a gap name that differs
     slightly from the exact OpenAlex topic string.
     """
-    stop_words = {'and', 'or', 'the', 'in', 'of', 'for', 'to', 'a', 'an', 'with', 'using'}
-    gap_words = {w.lower() for w in gap_subtopic.split()
-                 if w.lower() not in stop_words and len(w) > 2}
-    topic_words = {w.lower() for w in paper_topic.split()
-                   if w.lower() not in stop_words and len(w) > 2}
+    gap_words = _meaningful_words(gap_subtopic)
+    topic_words = _meaningful_words(paper_topic)
     if not gap_words or not topic_words:
         return False
     overlap = len(gap_words & topic_words)
     return overlap / min(len(gap_words), len(topic_words)) >= threshold
+
+
+def _is_relevant_to_search(subtopic_name: str, search_topic: str) -> bool:
+    """True if subtopic shares at least one meaningful word with the search topic.
+
+    Filters out subtopics from completely unrelated domains (e.g. 'Pulmonary
+    Hypertension Research' when searching 'large language models').
+    """
+    return len(_meaningful_words(subtopic_name) & _meaningful_words(search_topic)) >= 1
 
 
 def gap_detection_agent(
@@ -102,13 +116,23 @@ def gap_detection_agent(
     # ── Step 1: Build subtopic summary ──────────────────────────────
     trace.log("Building subtopic summary...")
 
-    # Filter out single-paper outliers with extreme citations from unrelated fields
-    filtered_subtopics = [
-        s for s in subtopics
-        if s.paper_count >= 2 or s.avg_citations < 500
-    ]
+    # Require at least 3 papers — single/dual-paper outliers inflate gap_score
+    # without representing a real research cluster.
+    filtered_subtopics = [s for s in subtopics if s.paper_count >= 3]
+    if len(filtered_subtopics) < 5:
+        filtered_subtopics = [s for s in subtopics if s.paper_count >= 2]
     if len(filtered_subtopics) < 5:
         filtered_subtopics = subtopics
+
+    # Additionally filter by keyword relevance to the original search topic.
+    # This removes subtopics from completely unrelated domains (e.g. "Pulmonary
+    # Hypertension" when searching "large language models").
+    if topic:
+        relevant = [s for s in filtered_subtopics if _is_relevant_to_search(s.name, topic)]
+        # Only apply relevance filter if it leaves enough candidates
+        if len(relevant) >= 5:
+            filtered_subtopics = relevant
+            trace.log(f"Relevance filter: kept {len(relevant)}/{len(subtopics)} subtopics related to '{topic}'")
 
     # FIX 2: Sort by gap_score (citation intensity ÷ recent supply) instead of raw citations
     sorted_subtopics = sorted(filtered_subtopics, key=_gap_score, reverse=True)
@@ -157,31 +181,34 @@ def gap_detection_agent(
     # ── Step 4: Prompt Nemotron ───────────────────────────────────
     trace.log("Calling Nemotron for gap analysis...")
 
-    prompt = f"""You are a research gap analyst for the domain: '{topic}'.
+    prompt = f"""You are a research gap analyst. Your job is to find under-researched areas within a SPECIFIC domain.
+
+DOMAIN: '{topic}'
 
 gap_score = avg_citations_per_paper ÷ (1 + recent_2024_papers).
-Higher gap_score = stronger unmet demand relative to recent output.
+Higher gap_score = high citation demand but low recent publication supply = stronger gap.
 
-Subtopics found in papers about '{topic}' (sorted by gap_score descending):
+Subtopics from papers about '{topic}' sorted by gap_score:
 {subtopic_summary}
 
 Year-by-year publication trends:
 {trend_summary}
 
-Semantically isolated emerging papers within '{topic}':
+Semantically isolated papers (emerging directions):
 {orphan_titles}
 
-TASK: Identify the top 3 research gaps within '{topic}'.
+TASK: Choose the top 3 research gaps within '{topic}'.
 
-CRITICAL RULES:
-1. You MUST use subtopic names ONLY from this exact list — copy the string character for character:
+STRICT RULES — violations will invalidate your response:
+1. subtopic field MUST be copied EXACTLY (character for character) from this list:
 {allowed_names}
-2. Do NOT invent, rephrase, or abbreviate subtopic names.
-3. Only choose gaps relevant to '{topic}' — ignore off-topic outliers.
-4. Prefer subtopics with high gap_score (high citation intensity, low recent output).
+2. Do NOT invent names, abbreviate, or rephrase subtopic names.
+3. Every gap MUST be directly relevant to '{topic}'. If a subtopic is about an unrelated field, SKIP it.
+4. Rank by gap_score (higher = better gap candidate).
+5. Return ONLY a JSON array. No explanation text before or after.
 
-Return ONLY valid JSON array (no markdown, no explanation before or after):
-[{{"subtopic":"exact name from list","why_its_a_gap":"2 sentence explanation","citation_demand":0.0,"publication_supply":0}}]"""
+Output format (replace values, keep keys exact):
+[{{"subtopic":"exact name from list above","why_its_a_gap":"2 sentences explaining why demand exceeds supply in context of {topic}","citation_demand":0.0,"publication_supply":0}}]"""
 
     try:
         response = ask(prompt, reasoning=True)
@@ -197,17 +224,14 @@ Return ONLY valid JSON array (no markdown, no explanation before or after):
 
     if response:
         try:
-            # FIX 6: Robust bracket-matching extraction
+            # Robust bracket-matching extraction
             cleaned = _extract_json_array(response)
             gaps_data = json.loads(cleaned)
 
-            # Create Gap objects
             for gap_data in gaps_data:
-                # Validate gap_data is a dict before processing
                 if not isinstance(gap_data, dict):
                     trace.log(f"Skipping invalid gap entry (not a dict): {type(gap_data)}")
                     continue
-
                 gap = Gap(
                     subtopic=gap_data.get("subtopic", "Unknown"),
                     why_its_a_gap=gap_data.get("why_its_a_gap", ""),
@@ -217,8 +241,12 @@ Return ONLY valid JSON array (no markdown, no explanation before or after):
                 )
                 gaps.append(gap)
 
-            trace.log(f"GAP DETECTION: found {len(gaps)} gaps")
-            return gaps
+            if gaps:
+                trace.log(f"GAP DETECTION: found {len(gaps)} gaps")
+                return gaps
+
+            # JSON parsed but all entries were non-dicts — fall through to fallback
+            trace.log("JSON valid but no dict entries found — using fallback")
 
         except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
             trace.log(f"JSON parsing failed: {e}, using fallback")
@@ -357,11 +385,9 @@ Return ONLY valid JSON:
 
                 # Create ResearchQuestion objects
                 for i, q_data in enumerate(questions_data):
-                    # Validate q_data is a dict before processing
                     if not isinstance(q_data, dict):
                         trace.log(f"  Skipping invalid question entry (not a dict): {type(q_data)}")
                         continue
-
                     question = ResearchQuestion(
                         gap=gap.subtopic,
                         question=q_data.get("question", ""),
@@ -370,27 +396,39 @@ Return ONLY valid JSON:
                         novelty_reason=q_data.get("novelty_reason", ""),
                     )
                     questions_for_gap.append(question)
-
-                    # Update gap.shared_assumption from first question
                     if i == 0 and q_data.get("shared_assumption"):
                         gap.shared_assumption = q_data.get("shared_assumption")
 
-                trace.log(f"QUESTIONS: generated {len(questions_for_gap)} questions for '{gap.subtopic}'")
-                all_questions.extend(questions_for_gap)
+                if questions_for_gap:
+                    trace.log(f"QUESTIONS: generated {len(questions_for_gap)} questions for '{gap.subtopic}'")
+                    all_questions.extend(questions_for_gap)
+                    continue  # skip fallback for this gap
+
+                # JSON parsed but all entries were non-dicts — fall through to fallback
+                trace.log(f"  No valid question dicts — using fallback for '{gap.subtopic}'")
 
             except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
                 trace.log(f"  JSON parsing failed: {e}, using fallback")
 
-                # Fallback: create basic questions from gap info
-                fallback_question = ResearchQuestion(
-                    gap=gap.subtopic,
-                    question=f"How can we improve outcomes in {gap.subtopic} by challenging existing assumptions about {gap.subtopic.lower()}?",
-                    methodology="Systematic literature review followed by empirical validation",
-                    foundational_papers=[p.title for p in top_papers[:3]],
-                    novelty_reason=f"Addresses the gap where citation demand ({gap.citation_demand:.0f}) far exceeds publication supply ({gap.publication_supply})",
-                )
-                all_questions.append(fallback_question)
-                trace.log(f"QUESTIONS: generated 1 question for '{gap.subtopic}' (fallback)")
+        # Fallback: derive a specific question from gap stats and paper titles
+        paper_hint = top_papers[0].title if top_papers else gap.subtopic
+        fallback_question = ResearchQuestion(
+            gap=gap.subtopic,
+            question=(
+                f"Within the field of {topic}, how does {gap.subtopic.lower()} "
+                f"affect outcomes — and what methodological approaches remain untested "
+                f"given the current citation demand ({gap.citation_demand:.0f}) "
+                f"versus publication supply ({gap.publication_supply})?"
+            ),
+            methodology="Systematic literature review followed by empirical validation study",
+            foundational_papers=[p.title for p in top_papers[:3]],
+            novelty_reason=(
+                f"High citation intensity on '{paper_hint[:60]}' signals strong community "
+                f"interest in {gap.subtopic} within {topic}, yet recent output is low."
+            ),
+        )
+        all_questions.append(fallback_question)
+        trace.log(f"QUESTIONS: generated 1 question for '{gap.subtopic}' (fallback)")
 
     return all_questions
 
